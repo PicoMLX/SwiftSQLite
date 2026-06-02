@@ -1,0 +1,212 @@
+import ArgumentParser
+import BashCommandKit
+import BashInterpreter
+import Foundation
+import SwiftSQLiteKit
+
+/// `sqlite3 [OPTIONS] DBFILE [SQL]` — run SQL against a SQLite database
+/// confined to the SwiftBash sandbox (PLAN.md §10).
+///
+/// SQL comes from the trailing arguments, or from stdin to EOF when none
+/// are given. Argv is captured raw (`.captureForPassthrough`) and parsed
+/// here so arbitrary SQL — which routinely contains `-`, `;`, quotes —
+/// is never mistaken for option syntax.
+public struct SqliteCommand: ParsableBashCommand {
+    public static let configuration = CommandConfiguration(
+        commandName: "sqlite3",
+        abstract: "Run SQL against a SQLite database inside the SwiftBash sandbox."
+    )
+
+    @Argument(parsing: .captureForPassthrough, help: "[OPTIONS] DBFILE [SQL]")
+    public var rawArgv: [String] = []
+
+    public init() {}
+
+    public mutating func execute() async throws -> ExitStatus {
+        var options = OutputOptions()
+        var readOnly = false
+        var auditEnabled = true
+        var auditPath: String?
+        var index = 0
+
+        // --- leading options (sqlite3-style single-dash long options) ---
+        while index < rawArgv.count {
+            let token = rawArgv[index]
+            guard token.hasPrefix("-"), token != "-" else { break }
+            switch token {
+            case "-readonly":
+                readOnly = true; index += 1
+            case "-header", "-headers":
+                options.header = true; index += 1
+            case "-noheader":
+                options.header = false; index += 1
+            case "-csv":
+                options.mode = .csv; index += 1
+            case "-json":
+                options.mode = .json; index += 1
+            case "-line":
+                options.mode = .line; index += 1
+            case "-list":
+                options.mode = .list; index += 1
+            case "-column":
+                options.mode = .column; options.header = true; index += 1
+            case "-mode":
+                guard let value = optionValue(after: index), let mode = OutputMode(rawValue: value) else {
+                    return usageError("-mode requires one of: "
+                        + OutputMode.allCases.map(\.rawValue).joined(separator: ", "))
+                }
+                options.mode = mode
+                if mode == .column { options.header = true }
+                index += 2
+            case "-separator", "-fieldsep":
+                guard let value = optionValue(after: index) else {
+                    return usageError("-separator requires an argument")
+                }
+                options.separator = value; index += 2
+            case "-nullvalue":
+                guard let value = optionValue(after: index) else {
+                    return usageError("-nullvalue requires an argument")
+                }
+                options.nullValue = value; index += 2
+            case "-audit":
+                guard let value = optionValue(after: index) else {
+                    return usageError("-audit requires a path")
+                }
+                auditPath = value; auditEnabled = true; index += 2
+            case "-no-audit", "-noaudit":
+                auditEnabled = false; index += 1
+            case "-help", "--help", "-h":
+                Shell.bashCurrent.stdout(usageText)
+                return .success
+            case "-version", "--version":
+                Shell.bashCurrent.stdout("SwiftSQLite — sqlite3 (libsqlite3 \(SQLiteEngine.version))\n")
+                return .success
+            default:
+                return usageError("unknown option: \(token)")
+            }
+        }
+
+        guard index < rawArgv.count else {
+            return usageError("missing DBFILE")
+        }
+        let dbfile = rawArgv[index]
+        index += 1
+        let sqlArguments = Array(rawArgv[index...])
+
+        // --- §4 native-file contract guard (skip for :memory:) ---
+        let isMemory = (dbfile == ":memory:")
+        if !isMemory, !backingReachesRealDisk(Shell.bashCurrent.fileSystem) {
+            Shell.bashCurrent.stderr("""
+                sqlite3: this shell's filesystem is not backed by real disk, \
+                so a database file cannot be opened safely. Use ':memory:' for \
+                an in-memory database, or run under a real filesystem / a \
+                --sandbox workspace. (See the native-file contract, PLAN.md §4.)
+
+                """)
+            return .failure
+        }
+
+        // --- build the connection ---
+        var policy = EnginePolicy()
+        policy.readOnly = readOnly
+
+        let shell = Shell.bashCurrent   // captured for the @Sendable authorize closure
+        let connection: SQLiteConnection
+        let databasePath: String
+        do {
+            if isMemory {
+                databasePath = ":memory:"
+                connection = try await SQLiteConnection(inMemory: policy, audit: InMemoryAuditSink())
+            } else {
+                let resolved = shell.resolvePath(dbfile)
+                databasePath = resolved
+                let databaseURL = URL(fileURLWithPath: resolved)
+                let sink = await makeAuditSink(
+                    enabled: auditEnabled, explicitPath: auditPath,
+                    databaseURL: databaseURL, shell: shell)
+                connection = try await SQLiteConnection(
+                    url: databaseURL,
+                    policy: policy,
+                    audit: sink,
+                    authorize: { url, _ in
+                        // §4: symlink-resolved containment. No-op when the
+                        // shell has no sandbox (a trusted, unconfined shell).
+                        try await shell.sandbox?.authorize(url)
+                    })
+            }
+        } catch {
+            Shell.bashCurrent.stderr("sqlite3: cannot open '\(dbfile)': \(errorText(error))\n")
+            return .failure
+        }
+
+        // --- run input, then always close (flushes the audit trail) ---
+        let state = SessionState(options: options, databasePath: databasePath)
+        let text: String
+        if sqlArguments.isEmpty {
+            text = await Shell.bashCurrent.stdin.readAllString()
+        } else {
+            text = sqlArguments.joined(separator: " ")
+        }
+        let status = await runSQLSession(text: text, connection: connection, state: state)
+        await connection.close()
+        return status
+    }
+
+    // MARK: helpers
+
+    private func optionValue(after index: Int) -> String? {
+        let next = index + 1
+        return next < rawArgv.count ? rawArgv[next] : nil
+    }
+
+    private func usageError(_ message: String) -> ExitStatus {
+        Shell.bashCurrent.stderr("sqlite3: \(message)\nusage: sqlite3 [OPTIONS] DBFILE [SQL]\n")
+        return ExitStatus(2)
+    }
+
+    /// Build the audit sink (writes JSON Lines **outside** the DB). The
+    /// default path is a `<db>.audit.log` sibling, which lives inside the
+    /// already-authorized directory. An explicit `-audit` path is authorized
+    /// too; if denied, audit is downgraded to in-memory (the command still
+    /// runs) rather than failing.
+    private func makeAuditSink(
+        enabled: Bool, explicitPath: String?, databaseURL: URL, shell: Shell
+    ) async -> any AuditSink {
+        guard enabled else { return InMemoryAuditSink() }
+        let auditURL = explicitPath
+            .map { URL(fileURLWithPath: shell.resolvePath($0)) }
+            ?? databaseURL.appendingPathExtension("audit.log")
+        do {
+            try await shell.sandbox?.authorize(auditURL)
+            return FileAuditSink(url: auditURL)
+        } catch {
+            shell.stderr("sqlite3: audit log disabled (path denied): \(errorText(error))\n")
+            return InMemoryAuditSink()
+        }
+    }
+}
+
+private let usageText = """
+usage: sqlite3 [OPTIONS] DBFILE [SQL]
+
+Run SQL against a SQLite database confined to the SwiftBash sandbox. SQL is
+read from the trailing arguments, or from stdin when none are given. Use
+':memory:' as DBFILE for an in-memory database.
+
+Options:
+  -readonly            Open the database read-only
+  -header | -noheader  Show / hide column headers
+  -mode MODE           Output mode: list (default) csv json column line
+  -csv -json           Shorthand for -mode csv / -mode json
+  -line -column -list  Shorthand for the matching -mode
+  -separator SEP       Field separator for list/column modes (default '|')
+  -nullvalue STR       Text to print for NULL (default empty)
+  -audit PATH          Write the audit log to PATH (default: <db>.audit.log)
+  -no-audit            Disable the persistent audit log
+  -help                Show this help
+  -version             Show the engine version
+
+Safe dot-commands: .tables .schema .indexes .databases .headers .mode
+.separator .nullvalue .dump .quit
+
+"""
