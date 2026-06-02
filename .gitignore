@@ -6,3 +6,10 @@ DerivedData/
 .swiftpm/configuration/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
+
+# Vendored SQLite amalgamation — fetched + SHA3-256-pinned by
+# scripts/fetch-sqlite.sh, never committed (see PLAN.md §9 / §M0).
+/Sources/CSQLite/sqlite3.c
+/Sources/CSQLite/include/sqlite3.h
+/Sources/CSQLite/include/sqlite3ext.h
+/Sources/CSQLite/shell.c

@@ -1,0 +1,7 @@
+module CSQLite {
+    // `sqlite3.h` is fetched + pinned by scripts/fetch-sqlite.sh and is
+    // NOT committed (see PLAN.md §9 / §M0). `csqlite_shims.h` IS committed.
+    header "sqlite3.h"
+    header "csqlite_shims.h"
+    export *
+}

@@ -1,0 +1,14 @@
+# SQLite amalgamation pin for SwiftSQLite's CSQLite target.
+# Consumed by scripts/fetch-sqlite.sh. Bump all four fields together.
+#
+# The amalgamation number encodes the version as XYYZZPP:
+#   3.47.2  ->  3047002 split as 3/47/02 -> file id 3470200
+# and lives under https://www.sqlite.org/<year>/.
+SQLITE_VERSION=3.47.2
+SQLITE_AMALGAMATION=sqlite-amalgamation-3470200
+SQLITE_YEAR=2024
+# Official SHA3-256 of the amalgamation .zip, copied verbatim from the
+# "Source Code" table on https://www.sqlite.org/download.html.
+# fetch-sqlite.sh FAILS CLOSED while this is the placeholder unless
+# SQLITE_ALLOW_UNPINNED=1 is exported — never relax that in CI.
+SQLITE_SHA3_256=REPLACE_WITH_OFFICIAL_SHA3_256_FROM_SQLITE_ORG
