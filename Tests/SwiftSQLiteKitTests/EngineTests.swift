@@ -1,0 +1,95 @@
+import Foundation
+import Testing
+@testable import SwiftSQLiteKit
+
+@Suite(.timeLimit(.minutes(1)))
+struct EngineTests {
+
+    @Test func crudRoundTrip() async throws {
+        let db = try await SQLiteConnection(inMemory: .default, audit: InMemoryAuditSink())
+        try await db.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, score REAL);")
+        let changes = try await db.execute(
+            "INSERT INTO t(name, score) VALUES ('alice', 1.5), ('bob', 2.0);")
+        #expect(changes == 2)
+
+        let result = try await db.query("SELECT id, name, score FROM t ORDER BY id;")
+        #expect(result.columns == ["id", "name", "score"])
+        #expect(result.rows.count == 2)
+        #expect(result.rows[0] == [.integer(1), .text("alice"), .real(1.5)])
+        #expect(result.rows[1] == [.integer(2), .text("bob"), .real(2.0)])
+        #expect(result.truncated == false)
+        await db.close()
+    }
+
+    @Test func valueTypesMapToStorageClasses() async throws {
+        let db = try await SQLiteConnection(inMemory: .default, audit: InMemoryAuditSink())
+        try await db.execute("CREATE TABLE t(i INTEGER, r REAL, s TEXT, b BLOB, n);")
+        try await db.execute("INSERT INTO t VALUES (42, 3.5, 'hi', x'00ff', NULL);")
+        let row = try await db.query("SELECT i, r, s, b, n FROM t;").rows[0]
+        #expect(row[0] == .integer(42))
+        #expect(row[1] == .real(3.5))
+        #expect(row[2] == .text("hi"))
+        #expect(row[3] == .blob(Data([0x00, 0xff])))
+        #expect(row[4] == .null)
+        await db.close()
+    }
+
+    @Test func syntaxErrorMapsToSQLiteError() async throws {
+        let db = try await SQLiteConnection(inMemory: .default, audit: InMemoryAuditSink())
+        do {
+            _ = try await db.query("SELEKT 1;")
+            Issue.record("expected a SQLiteError for invalid SQL")
+        } catch let error as SQLiteError {
+            #expect(error.code != 0)
+        }
+        await db.close()
+    }
+
+    @Test func rowLimitSetsTruncated() async throws {
+        var policy = EnginePolicy()
+        policy.rowLimit = 5
+        let db = try await SQLiteConnection(inMemory: policy, audit: InMemoryAuditSink())
+        try await db.execute("CREATE TABLE t(x);")
+        let values = (1...20).map { "(\($0))" }.joined(separator: ",")
+        try await db.execute("INSERT INTO t(x) VALUES \(values);")
+
+        let result = try await db.query("SELECT x FROM t ORDER BY x;")
+        #expect(result.rows.count == 5)
+        #expect(result.truncated == true)
+        await db.close()
+    }
+
+    @Test func longRunningQueryIsInterruptedByTimeout() async throws {
+        var policy = EnginePolicy()
+        policy.statementTimeout = .milliseconds(100)
+        policy.rowLimit = 1_000_000_000
+        let db = try await SQLiteConnection(inMemory: policy, audit: InMemoryAuditSink())
+        do {
+            // A non-terminating recursive CTE — only the progress handler
+            // can stop it.
+            _ = try await db.query(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) "
+                    + "SELECT max(x) FROM c;")
+            Issue.record("expected the statement to be interrupted")
+        } catch let error as SQLiteEngineError {
+            #expect(error == .timedOut || error == .interrupted)
+        } catch {
+            // A raw SQLITE_INTERRUPT surfaced as SQLiteError is acceptable too.
+        }
+        await db.close()
+    }
+
+    @Test func openGateRejectionBlocksOpen() async throws {
+        let url = makeTempDatabaseURL()
+        defer { cleanupTempDB(url) }
+        do {
+            _ = try await SQLiteConnection(
+                url: url, audit: InMemoryAuditSink(),
+                authorize: { _, _ in throw StubDenied() })
+            Issue.record("expected the open to be blocked by the authorize closure")
+        } catch is StubDenied {
+            // expected — and the file must not have been created
+            #expect(FileManager.default.fileExists(atPath: url.path) == false)
+        }
+    }
+}

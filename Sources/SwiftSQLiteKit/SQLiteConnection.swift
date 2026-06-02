@@ -1,0 +1,320 @@
+import CSQLite
+import Dispatch
+import Foundation
+
+/// A serialized connection to one SQLite database, hardened for running
+/// untrusted SQL inside a sandbox (PLAN.md §3, §5, §7).
+///
+/// The engine is **SwiftBash-agnostic**: it takes a host `URL` plus an
+/// `authorize` closure (the SwiftBash seam, or a stub in tests) and never
+/// resolves paths itself.
+public actor SQLiteConnection {
+    private var db: OpaquePointer?
+    private let policy: EnginePolicy
+    private let audit: any AuditSink
+    private let ctx: EngineContext
+    /// The exact string passed to `sqlite3_open_v2` — for a file URL this
+    /// is `url.path`, i.e. the same string the caller authorized (§4).
+    private let location: String
+    private var isClosed = false
+
+    /// A connection to the file at `url` (a HOST file URL — the caller is
+    /// responsible for resolution and sandboxing). `authorize` is invoked
+    /// with `(url, intent)` **before** any C call; throwing from it aborts
+    /// the open (PLAN.md §5, step 1).
+    public init(
+        url: URL,
+        policy: EnginePolicy = .default,
+        audit: any AuditSink,
+        authorize: @Sendable (URL, AccessIntent) async throws -> Void
+    ) async throws {
+        self.policy = policy
+        self.audit = audit
+        self.ctx = EngineContext(
+            reservedTablePrefix: policy.reservedTablePrefix,
+            readOnly: policy.readOnly)
+        self.location = url.isFileURL ? url.path : url.absoluteString
+
+        let intent: AccessIntent = policy.readOnly ? .read : .create
+        try await authorize(url, intent)
+        try openDatabase()
+        try configure()
+    }
+
+    /// An in-memory database (PLAN.md open-knob #3) — the supported answer
+    /// for callers without a real host file. There is no path to gate, so
+    /// no `authorize` closure is taken.
+    public init(
+        inMemory policy: EnginePolicy = .default,
+        audit: any AuditSink
+    ) async throws {
+        self.policy = policy
+        self.audit = audit
+        self.ctx = EngineContext(
+            reservedTablePrefix: policy.reservedTablePrefix,
+            readOnly: policy.readOnly)
+        self.location = ":memory:"
+        try openDatabase()
+        try configure()
+    }
+
+    deinit {
+        // Safety net if `close()` was never called. No audit flush is
+        // possible here (deinit is synchronous); callers should `close()`.
+        if let db, !isClosed { sqlite3_close_v2(db) }
+    }
+
+    // MARK: Open + harden
+
+    private func openDatabase() throws {
+        var handle: OpaquePointer?
+        var flags: Int32 = policy.readOnly
+            ? SQLITE_OPEN_READONLY
+            : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
+        // Syscall-level symlink backstop (§4). No SQLITE_OPEN_URI — file:
+        // URI tricks are off here and at compile time (SQLITE_USE_URI=0).
+        flags |= SQLITE_OPEN_NOFOLLOW
+
+        let rc = sqlite3_open_v2(location, &handle, flags, nil)
+        if rc != SQLITE_OK {
+            let message = handle.map { String(cString: sqlite3_errmsg($0)) }
+                ?? "unable to open database"
+            if let handle { sqlite3_close_v2(handle) }
+            throw SQLiteError(code: rc, message: message)
+        }
+        guard let handle else {
+            throw SQLiteError(code: rc, message: "open returned no handle")
+        }
+        self.db = handle
+    }
+
+    /// Runtime hardening + the pragmas we need, then install the
+    /// authorizer and hooks (PLAN.md §7). Order matters: pragmas are
+    /// issued *before* the authorizer (which denies all user PRAGMA).
+    private func configure() throws {
+        guard let db else { throw SQLiteEngineError.notOpen }
+
+        _ = csqlite_db_config_onoff(db, SQLITE_DBCONFIG_DEFENSIVE, 1)
+        _ = csqlite_db_config_onoff(db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0)
+        _ = csqlite_db_config_onoff(db, SQLITE_DBCONFIG_TRUSTED_SCHEMA, 0)
+
+        sqlite3_limit(db, SQLITE_LIMIT_ATTACHED, 0)
+        sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, Int32(clamping: policy.maxSQLLength))
+        sqlite3_busy_timeout(db, policy.busyTimeout.millisecondsInt32)
+
+        try execInternal("PRAGMA foreign_keys=ON;")
+        try execInternal("PRAGMA temp_store=MEMORY;")   // pin temp spill (§5 step 2)
+        if location != ":memory:" && !policy.readOnly {
+            // WAL keeps -wal/-shm as in-dir siblings; best-effort.
+            _ = try? execInternal("PRAGMA journal_mode=WAL;")
+        }
+
+        let appData = Unmanaged.passUnretained(ctx).toOpaque()
+        sqlite3_set_authorizer(db, csqliteAuthorizerCallback, appData)
+        sqlite3_progress_handler(db, 10_000, csqliteProgressCallback, appData)
+        _ = sqlite3_commit_hook(db, csqliteCommitCallback, appData)
+        _ = sqlite3_update_hook(db, csqliteUpdateCallback, appData)
+        _ = sqlite3_rollback_hook(db, csqliteRollbackCallback, appData)
+    }
+
+    // MARK: Public API
+
+    /// Run a SQL script (one or more statements). Every column-returning
+    /// statement contributes a `ResultSet`. Audit events are flushed to
+    /// the sink afterward, on success *or* failure.
+    @discardableResult
+    public func run(_ sql: String) async throws -> RunResult {
+        try ensureOpen()
+        let timeoutNanos = policy.statementTimeout.nanoseconds
+        ctx.beginScript(deadlineNanos: timeoutNanos == 0
+            ? nil
+            : DispatchTime.now().uptimeNanoseconds &+ timeoutNanos)
+
+        let box = InterruptBox(db: db, ctx: ctx)
+        do {
+            let result = try await withTaskCancellationHandler {
+                try self.runScript(sql)
+            } onCancel: {
+                box.interrupt()
+            }
+            await flushAudit()
+            return result
+        } catch {
+            await flushAudit()   // surface attempted-denied / partial events too
+            throw error
+        }
+    }
+
+    /// Convenience: run `sql` and return the number of rows changed.
+    @discardableResult
+    public func execute(_ sql: String) async throws -> Int {
+        try await run(sql).changes
+    }
+
+    /// Convenience: run `sql` and return the last column-returning
+    /// statement's rows (capped + timed).
+    public func query(_ sql: String) async throws -> ResultSet {
+        let result = try await run(sql)
+        return result.results.last ?? ResultSet(columns: [], rows: [], truncated: false)
+    }
+
+    public func close() async {
+        guard !isClosed else { return }
+        isClosed = true
+        await flushAudit()
+        ctx.discardPending()
+        if let db {
+            sqlite3_set_authorizer(db, nil, nil)
+            sqlite3_close_v2(db)
+        }
+        db = nil
+    }
+
+    // MARK: Step loop
+
+    private func runScript(_ sql: String) throws -> RunResult {
+        guard let db else { throw SQLiteEngineError.notOpen }
+        var results: [ResultSet] = []
+        var totalChanges = 0
+
+        try sql.withCString { start in
+            var cursor: UnsafePointer<CChar>? = start
+            while let head = cursor, head.pointee != 0 {
+                var statement: OpaquePointer?
+                var tail: UnsafePointer<CChar>?
+                let rc = sqlite3_prepare_v2(db, head, -1, &statement, &tail)
+                if rc != SQLITE_OK {
+                    throw SQLiteError(code: rc, message: String(cString: sqlite3_errmsg(db)))
+                }
+                cursor = tail
+                guard let statement else { continue }   // whitespace / comment
+                defer { sqlite3_finalize(statement) }
+                if let resultSet = try step(statement) {
+                    results.append(resultSet)
+                } else {
+                    // Only write/DDL statements contribute a change count;
+                    // sqlite3_changes() after a SELECT is stale.
+                    totalChanges += Int(sqlite3_changes(db))
+                }
+            }
+        }
+        return RunResult(results: results, changes: totalChanges)
+    }
+
+    /// Drive one prepared statement to completion. Returns a `ResultSet`
+    /// for column-returning statements, `nil` otherwise.
+    private func step(_ statement: OpaquePointer) throws -> ResultSet? {
+        let columnCount = Int(sqlite3_column_count(statement))
+
+        if columnCount == 0 {
+            while true {
+                let rc = sqlite3_step(statement)
+                if rc == SQLITE_DONE { break }
+                if rc == SQLITE_ROW { continue }
+                throw mapStepError(rc)
+            }
+            return nil
+        }
+
+        var columns: [String] = []
+        columns.reserveCapacity(columnCount)
+        for index in 0..<columnCount {
+            columns.append(String(cString: sqlite3_column_name(statement, Int32(index))))
+        }
+
+        var rows: [[SQLiteValue]] = []
+        var truncated = false
+        loop: while true {
+            let rc = sqlite3_step(statement)
+            switch rc {
+            case SQLITE_ROW:
+                if rows.count >= policy.rowLimit {
+                    truncated = true
+                    break loop
+                }
+                var row: [SQLiteValue] = []
+                row.reserveCapacity(columnCount)
+                for index in 0..<columnCount {
+                    row.append(columnValue(statement, Int32(index)))
+                }
+                rows.append(row)
+            case SQLITE_DONE:
+                break loop
+            default:
+                throw mapStepError(rc)
+            }
+        }
+        return ResultSet(columns: columns, rows: rows, truncated: truncated)
+    }
+
+    private func columnValue(_ statement: OpaquePointer, _ index: Int32) -> SQLiteValue {
+        switch sqlite3_column_type(statement, index) {
+        case SQLITE_INTEGER:
+            return .integer(sqlite3_column_int64(statement, index))
+        case SQLITE_FLOAT:
+            return .real(sqlite3_column_double(statement, index))
+        case SQLITE_TEXT:
+            if let text = sqlite3_column_text(statement, index) {
+                return .text(String(decodingCString: text, as: UTF8.self))
+            }
+            return .text("")
+        case SQLITE_BLOB:
+            if let bytes = sqlite3_column_blob(statement, index) {
+                let count = Int(sqlite3_column_bytes(statement, index))
+                return .blob(Data(bytes: bytes, count: count))
+            }
+            return .blob(Data())
+        default:
+            return .null
+        }
+    }
+
+    private func mapStepError(_ rc: Int32) -> Error {
+        if rc == SQLITE_INTERRUPT {
+            if let deadline = ctx.deadlineNanos,
+               DispatchTime.now().uptimeNanoseconds > deadline {
+                return SQLiteEngineError.timedOut
+            }
+            return SQLiteEngineError.interrupted
+        }
+        let message = db.map { String(cString: sqlite3_errmsg($0)) } ?? "step failed"
+        return SQLiteError(code: rc, message: message)
+    }
+
+    // MARK: Helpers
+
+    @discardableResult
+    private func execInternal(_ sql: String) throws -> Int {
+        guard let db else { throw SQLiteEngineError.notOpen }
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let rc = sqlite3_exec(db, sql, nil, nil, &errorMessage)
+        defer { sqlite3_free(errorMessage) }
+        if rc != SQLITE_OK {
+            let message = errorMessage.map { String(cString: $0) } ?? "exec failed"
+            throw SQLiteError(code: rc, message: message)
+        }
+        return Int(sqlite3_changes(db))
+    }
+
+    private func flushAudit() async {
+        let events = ctx.drainEvents()
+        guard !events.isEmpty else { return }
+        await audit.record(events)
+    }
+
+    private func ensureOpen() throws {
+        if isClosed || db == nil { throw SQLiteEngineError.notOpen }
+    }
+}
+
+/// Carries the raw `sqlite3*` across to the (`@Sendable`) cancellation
+/// handler. `sqlite3_interrupt` is documented thread-safe with
+/// `SQLITE_THREADSAFE=1`, and `EngineContext` is `@unchecked Sendable`.
+private struct InterruptBox: @unchecked Sendable {
+    let db: OpaquePointer?
+    let ctx: EngineContext
+    func interrupt() {
+        ctx.cancelled = true
+        if let db { sqlite3_interrupt(db) }
+    }
+}
