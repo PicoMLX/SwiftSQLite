@@ -17,11 +17,10 @@ concurrency:
 # SwiftBash-agnostic and Linux-clean, so a Linux engine-only job can be added
 # later without that closure.
 #
-# Package.resolved pins marcprux/swift-archive by revision — its `master`
-# branch was renamed, so a fresh resolve would otherwise fail chasing the dead
-# ref. scripts/fetch-sqlite.sh then downloads + SHA3-256-verifies the SQLite
-# amalgamation (fail-closed on mismatch); the runner needs network access to
-# sqlite.org.
+# The SQLite amalgamation (sqlite3.c/.h) is vendored (committed), so the build
+# needs no network. Package.resolved pins marcprux/swift-archive by revision —
+# its `master` branch was renamed, so a fresh resolve would otherwise fail
+# chasing the dead ref.
 
 jobs:
   build-macos:
@@ -44,8 +43,6 @@ jobs:
           done
       - name: Verify Swift version
         run: swift --version
-      - name: Fetch SQLite amalgamation
-        run: ./scripts/fetch-sqlite.sh
       - name: Build (including tests)
         run: swift build --build-tests -v
       - name: Test
