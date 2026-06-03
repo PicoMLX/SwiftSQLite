@@ -33,6 +33,20 @@ public struct EnginePolicy: Sendable {
     /// copied out (e.g. `SELECT zeroblob(...)`). Default 50 MB.
     public var maxValueBytes: Int = 50_000_000
 
+    /// Cumulative byte ceiling for one statement's buffered result set.
+    /// `rowLimit × maxValueBytes` alone permits hundreds of GB, so the
+    /// single-cell cap is not a real DoS bound; this caps the *total*
+    /// copied-out result memory (extra rows set `ResultSet.truncated` and stop
+    /// the step loop). Default 256 MB.
+    public var maxResultBytes: Int = 256_000_000
+
+    /// Ceiling on in-memory audit records — both the pending-commit buffer and
+    /// the per-script attempted/committed buffer. Untrusted SQL that writes
+    /// many rows in one transaction (amplified by the row-by-row DELETE audit)
+    /// would otherwise grow these without bound; past the cap, records are
+    /// dropped after a single `_AUDIT_TRUNCATED` marker. Default 1,000,000.
+    public var maxAuditRecords: Int = 1_000_000
+
     public init() {}
 
     public static let `default` = EnginePolicy()

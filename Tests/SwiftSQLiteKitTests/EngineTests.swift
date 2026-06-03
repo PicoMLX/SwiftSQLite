@@ -59,6 +59,25 @@ struct EngineTests {
         await db.close()
     }
 
+    /// The total result-byte cap bounds a result set's memory even when the
+    /// row count is far below `rowLimit` — `rowLimit × maxValueBytes` alone is
+    /// not a real DoS bound.
+    @Test func resultByteCapSetsTruncated() async throws {
+        var policy = EnginePolicy()
+        policy.rowLimit = 1_000_000          // not the limiting factor here
+        policy.maxResultBytes = 10_000       // ~10 KB total
+        let db = try await SQLiteConnection(inMemory: policy, audit: InMemoryAuditSink())
+        try await db.execute("CREATE TABLE t(x);")
+        let cell = String(repeating: "a", count: 1_000)   // ~1 KB per row
+        let values = (1...200).map { _ in "('\(cell)')" }.joined(separator: ",")
+        try await db.execute("INSERT INTO t(x) VALUES \(values);")
+
+        let result = try await db.query("SELECT x FROM t;")
+        #expect(result.truncated == true)
+        #expect(result.rows.count < 200, "rows: \(result.rows.count)")
+        await db.close()
+    }
+
     @Test func longRunningQueryIsInterruptedByTimeout() async throws {
         var policy = EnginePolicy()
         policy.statementTimeout = .milliseconds(100)

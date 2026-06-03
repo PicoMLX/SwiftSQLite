@@ -200,6 +200,21 @@ public struct SqliteCommand: ParsableBashCommand {
         } else {
             return InMemoryAuditSink()
         }
+        // Refuse an audit path that resolves to the database file or one of its
+        // SQLite sidecars: a FileAuditSink appending JSON Lines into the live DB
+        // (or its -wal/-shm/-journal) would corrupt it after otherwise-successful
+        // SQL. The audit trail is contractually written *outside* the database.
+        if let databaseURL {
+            let dbPath = databaseURL.standardizedFileURL.path
+            let auditPath = auditURL.standardizedFileURL.path
+            if auditPath == dbPath || ["-wal", "-shm", "-journal"].contains(
+                where: { auditPath == dbPath + $0 }) {
+                throw AuditPathDenied(
+                    message: "-audit path overlaps the database file or its "
+                    + "sidecars (\(auditPath)); the audit trail must be written "
+                    + "outside the database")
+            }
+        }
         do {
             try await shell.sandbox?.authorize(auditURL)
             return FileAuditSink(url: auditURL)

@@ -77,4 +77,25 @@ struct ContractGuardTests {
             #expect(result.stderr.contains("audit"), "stderr: \(result.stderr)")
         }
     }
+
+    /// An explicit `-audit PATH` that resolves to the database file itself must
+    /// be rejected: a FileAuditSink appending JSON Lines into the live DB would
+    /// corrupt it. (The trail is contractually written *outside* the database.)
+    @Test func auditPathOverlappingDatabaseIsRejected() async throws {
+        try await withTempDirectory { workspace in
+            let shell = Shell(
+                fileSystem: MountedFileSystem(
+                    mounts: [.init(virtual: workspace, host: workspace)],
+                    backing: RealFileSystem()),
+                environment: Environment(variables: [:], workingDirectory: workspace))
+            shell.sandbox = Sandbox.bashWorkspace(workspace: workspace)
+            shell.installShellBuiltin(SqliteCommand.self)
+
+            let result = try await runCapturing(
+                shell,
+                "sqlite3 -audit \(workspace)/t.db \(workspace)/t.db 'CREATE TABLE t(x);'")
+            #expect(!result.status.isSuccess)
+            #expect(result.stderr.contains("overlap"), "stderr: \(result.stderr)")
+        }
+    }
 }

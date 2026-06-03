@@ -28,4 +28,16 @@ public extension SQLiteValue {
         case .blob(let data): return "<\(data.count) bytes>"
         }
     }
+
+    /// Approximate copied-out byte size — used to bound a result set's *total*
+    /// memory (`EnginePolicy.maxResultBytes`). TEXT/BLOB dominate; scalars and
+    /// NULL count as a small fixed cost so wide all-scalar rows still register.
+    var approxByteSize: Int {
+        switch self {
+        case .null: return 1
+        case .integer, .real: return 8
+        case .text(let s): return s.utf8.count
+        case .blob(let data): return data.count
+        }
+    }
 }

@@ -134,4 +134,30 @@ struct AuditTests {
             return false
         }, "released savepoint insert should be committed, got \(committed)")
     }
+
+    /// The in-memory audit buffers are bounded: past `maxAuditRecords`, records
+    /// are dropped after a single `_AUDIT_TRUNCATED` marker, so untrusted
+    /// high-volume writes can't grow them without bound. Enforcement (the
+    /// authorizer decision) is unaffected by the cap.
+    @Test func auditBuffersAreCappedWithMarker() async throws {
+        var policy = EnginePolicy()
+        policy.maxAuditRecords = 10
+        let sink = InMemoryAuditSink()
+        let db = try await SQLiteConnection(inMemory: policy, audit: sink)
+        try await db.execute("CREATE TABLE t(x);")
+        let values = (1...100).map { "(\($0))" }.joined(separator: ",")
+        try await db.run("INSERT INTO t(x) VALUES \(values);")
+        await db.close()
+
+        let all = await sink.events
+        #expect(all.contains {
+            if case .attempted(action: "_AUDIT_TRUNCATED", table: _, allowed: _) = $0 {
+                return true
+            }
+            return false
+        }, "expected a truncation marker, got \(all.count) events")
+        // The committed stream did not record all 100 inserts (bounded).
+        let committed = await sink.committed
+        #expect(committed.count <= 20, "committed: \(committed.count)")
+    }
 }

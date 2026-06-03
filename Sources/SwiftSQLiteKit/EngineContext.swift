@@ -17,6 +17,8 @@ import Foundation
 final class EngineContext: @unchecked Sendable {
     private let reservedPrefix: String          // lowercased; "" disables
     private let readOnly: Bool
+    private let maxAuditRecords: Int            // cap on `events`/`pending`
+    private var auditTruncated = false          // latched per transaction
 
     /// Drained to the `AuditSink` after each script / on close.
     private(set) var events: [AuditEvent] = []
@@ -30,9 +32,10 @@ final class EngineContext: @unchecked Sendable {
 
     var deadlineNanos: UInt64?
 
-    init(reservedTablePrefix: String, readOnly: Bool) {
+    init(reservedTablePrefix: String, readOnly: Bool, maxAuditRecords: Int) {
         self.reservedPrefix = reservedTablePrefix.lowercased()
         self.readOnly = readOnly
+        self.maxAuditRecords = maxAuditRecords
     }
 
     // MARK: Authorizer (PLAN.md §7)
@@ -42,10 +45,16 @@ final class EngineContext: @unchecked Sendable {
     /// audit event for every decision.
     func authorize(action: Int32, arg1: String?, arg2: String?) -> Int32 {
         let decision = decide(action: action, arg1: arg1, arg2: arg2)
-        events.append(.attempted(
-            action: Self.actionName(action),
-            table: guardedObjectName(action: action, arg1: arg1, arg2: arg2),
-            allowed: decision != SQLITE_DENY))
+        // The decision above is returned regardless of the audit cap, so
+        // bounding the buffer never weakens enforcement — only recording.
+        if events.count < maxAuditRecords {
+            events.append(.attempted(
+                action: Self.actionName(action),
+                table: guardedObjectName(action: action, arg1: arg1, arg2: arg2),
+                allowed: decision != SQLITE_DENY))
+        } else {
+            noteAuditTruncated()
+        }
         // Track savepoint boundaries so `ROLLBACK TO s` drops the pending
         // committed-audit rows recorded after `s`. arg1 is the operation
         // ("BEGIN"/"RELEASE"/"ROLLBACK"), arg2 the savepoint name. The
@@ -209,6 +218,7 @@ final class EngineContext: @unchecked Sendable {
     /// to those tables. The authorizer still records the INSERT/UPDATE/DELETE
     /// in the attempted stream, which remains the authoritative intent log.
     func recordUpdate(op: Int32, table: String?, rowid: Int64) {
+        guard pending.count < maxAuditRecords else { noteAuditTruncated(); return }
         let opName: String
         switch op {
         case SQLITE_INSERT: opName = "INSERT"
@@ -219,6 +229,15 @@ final class EngineContext: @unchecked Sendable {
         pending.append((table: table ?? "", rowid: rowid, op: opName))
     }
 
+    /// Record (once per transaction) that the audit buffers hit `maxAuditRecords`
+    /// and started dropping records. Bounded memory beats unbounded fidelity for
+    /// untrusted SQL; the marker keeps the trail honest about the gap.
+    private func noteAuditTruncated() {
+        guard !auditTruncated else { return }
+        auditTruncated = true
+        events.append(.attempted(action: "_AUDIT_TRUNCATED", table: nil, allowed: false))
+    }
+
     /// Promote everything in `pending` into the committed stream.
     func commit() {
         for record in pending {
@@ -226,6 +245,7 @@ final class EngineContext: @unchecked Sendable {
         }
         pending.removeAll(keepingCapacity: true)
         savepoints.removeAll(keepingCapacity: true)
+        auditTruncated = false
     }
 
     /// Drop pending rows — the transaction rolled back, so they never
@@ -239,6 +259,7 @@ final class EngineContext: @unchecked Sendable {
     func rollback() {
         pending.removeAll(keepingCapacity: true)
         savepoints.removeAll(keepingCapacity: true)
+        auditTruncated = false
     }
 
     // MARK: Timeout / cancellation

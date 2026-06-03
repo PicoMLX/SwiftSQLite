@@ -52,7 +52,8 @@ public actor SQLiteConnection {
         self.audit = audit
         let ctx = EngineContext(
             reservedTablePrefix: policy.reservedTablePrefix,
-            readOnly: policy.readOnly)
+            readOnly: policy.readOnly,
+            maxAuditRecords: policy.maxAuditRecords)
         self.ctx = ctx
         // Canonicalize ONCE, before authorize, so the authorized path and the
         // opened path are the same fully symlink-resolved string. NOFOLLOW (in
@@ -89,7 +90,8 @@ public actor SQLiteConnection {
         self.audit = audit
         let ctx = EngineContext(
             reservedTablePrefix: policy.reservedTablePrefix,
-            readOnly: policy.readOnly)
+            readOnly: policy.readOnly,
+            maxAuditRecords: policy.maxAuditRecords)
         self.ctx = ctx
         self.handle = ConnectionHandle(location: ":memory:", policy: policy, ctx: ctx)
         try handle.open(allowCreate: true)
@@ -363,6 +365,7 @@ private final class ConnectionHandle: @unchecked Sendable {
 
         var rows: [[SQLiteValue]] = []
         var truncated = false
+        var resultBytes = 0
         loop: while true {
             let rc = sqlite3_step(statement)
             switch rc {
@@ -377,6 +380,13 @@ private final class ConnectionHandle: @unchecked Sendable {
                     row.append(columnValue(statement, Int32(index)))
                 }
                 rows.append(row)
+                // Bound *total* buffered result memory, not just per-cell
+                // (`maxValueBytes`) × `rowLimit`, which permits hundreds of GB.
+                resultBytes += row.reduce(0) { $0 + $1.approxByteSize }
+                if resultBytes > policy.maxResultBytes {
+                    truncated = true
+                    break loop
+                }
             case SQLITE_DONE:
                 break loop
             default:
