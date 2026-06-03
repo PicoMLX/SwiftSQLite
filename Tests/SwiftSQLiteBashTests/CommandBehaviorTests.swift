@@ -19,6 +19,19 @@ struct CommandBehaviorTests {
         #expect(result.stdout.contains("\"b\":\"x\""))
     }
 
+    /// JSON output preserves column order and duplicate column names — a
+    /// dictionary-backed encoder reorders keys and collapses duplicates, which
+    /// is silent data loss for `SELECT *` over a join.
+    @Test func jsonPreservesColumnOrderAndDuplicates() async throws {
+        let shell = Shell()
+        shell.installShellBuiltin(SqliteCommand.self)
+        let result = try await runCapturing(
+            shell, "sqlite3 -json :memory: \"SELECT 2 AS b, 1 AS a, 3 AS a;\"")
+        #expect(result.status.isSuccess)
+        #expect(result.stdout.contains("{\"b\":2,\"a\":1,\"a\":3}"),
+                "stdout: \(result.stdout)")
+    }
+
     @Test func csvWithHeader() async throws {
         let shell = Shell()
         shell.installShellBuiltin(SqliteCommand.self)

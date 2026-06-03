@@ -82,35 +82,65 @@ enum ResultRenderer {
     // MARK: json
 
     private static func renderJSON(_ rs: ResultSet, _ options: OutputOptions) -> String {
-        var objects: [[String: Any]] = []
+        // Assemble objects by hand rather than via `[String: Any]`: a dictionary
+        // silently drops duplicate column names — common with `SELECT *` over a
+        // join (`SELECT a.id, b.id …`) — and reorders keys. Real sqlite3 `-json`
+        // preserves both column order and duplicate keys, so we do too.
+        var objects: [String] = []
         objects.reserveCapacity(rs.rows.count)
         for row in rs.rows {
-            var object: [String: Any] = [:]
-            for (index, column) in rs.columns.enumerated() where index < row.count {
-                object[column] = jsonValue(row[index])
+            var pairs: [String] = []
+            pairs.reserveCapacity(rs.columns.count)
+            for (index, column) in rs.columns.enumerated() {
+                let value = index < row.count ? row[index] : .null
+                pairs.append(jsonString(column) + ":" + jsonValue(value))
             }
-            objects.append(object)
+            objects.append("{" + pairs.joined(separator: ",") + "}")
         }
-        guard
-            let data = try? JSONSerialization.data(
-                withJSONObject: objects, options: [.sortedKeys]),
-            let string = String(data: data, encoding: .utf8)
-        else { return "[]\n" }
-        return string + "\n"
+        return "[" + objects.joined(separator: ",") + "]\n"
     }
 
-    private static func jsonValue(_ value: SQLiteValue) -> Any {
+    /// One cell as a JSON literal (string / number / null / base64 blob).
+    private static func jsonValue(_ value: SQLiteValue) -> String {
         switch value {
-        case .null: return NSNull()
-        case .integer(let i): return i
+        case .null: return "null"
+        case .integer(let i): return String(i)
         case .real(let d):
-            // JSON (and JSONSerialization) can't represent Infinity/NaN; emit
-            // them as strings so a single non-finite cell doesn't make the
-            // whole result set fail to serialize.
-            return d.isFinite ? d : String(d)
-        case .text(let s): return s
-        case .blob(let data): return data.base64EncodedString()
+            // JSON can't represent Infinity/NaN; emit them as strings so a
+            // single non-finite cell doesn't corrupt the whole document.
+            return d.isFinite ? jsonNumber(d) : jsonString(String(d))
+        case .text(let s): return jsonString(s)
+        case .blob(let data): return jsonString(data.base64EncodedString())
         }
+    }
+
+    /// A finite `Double` as a JSON number, reusing Foundation's formatting for
+    /// parity with the previous serializer (e.g. `1.0` -> `1`, `0.1` -> `0.1`).
+    private static func jsonNumber(_ d: Double) -> String {
+        if let data = try? JSONSerialization.data(withJSONObject: [d]),
+           let s = String(data: data, encoding: .utf8) {
+            return String(s.dropFirst().dropLast())   // strip the array's [ ]
+        }
+        return String(d)
+    }
+
+    /// Escape a string as a JSON string literal, including the quotes.
+    private static func jsonString(_ s: String) -> String {
+        var out = "\""
+        for scalar in s.unicodeScalars {
+            switch scalar {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            case let c where c.value < 0x20:
+                out += String(format: "\\u%04x", c.value)
+            default:
+                out.unicodeScalars.append(scalar)
+            }
+        }
+        return out + "\""
     }
 
     // MARK: column
