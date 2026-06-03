@@ -175,7 +175,12 @@ public actor SQLiteConnection {
     private func runScript(_ sql: String) throws -> RunResult {
         guard let db else { throw SQLiteEngineError.notOpen }
         var results: [ResultSet] = []
-        var totalChanges = 0
+        // Attribute changes via the monotonic total-changes counter so that
+        // DDL, COMMIT, and other non-DML statements don't re-add a prior
+        // DML's count — sqlite3_changes() persists until the next DML, so
+        // summing it per columnless statement over-counts scripts that mix
+        // writes with transaction control or schema changes.
+        let startTotal = Int(sqlite3_total_changes(db))
 
         try sql.withCString { start in
             var cursor: UnsafePointer<CChar>? = start
@@ -191,14 +196,11 @@ public actor SQLiteConnection {
                 defer { sqlite3_finalize(statement) }
                 if let resultSet = try step(statement) {
                     results.append(resultSet)
-                } else {
-                    // Only write/DDL statements contribute a change count;
-                    // sqlite3_changes() after a SELECT is stale.
-                    totalChanges += Int(sqlite3_changes(db))
                 }
             }
         }
-        return RunResult(results: results, changes: totalChanges)
+        let changed = Int(sqlite3_total_changes(db)) - startTotal
+        return RunResult(results: results, changes: changed)
     }
 
     /// Drive one prepared statement to completion. Returns a `ResultSet`
@@ -254,8 +256,12 @@ public actor SQLiteConnection {
         case SQLITE_FLOAT:
             return .real(sqlite3_column_double(statement, index))
         case SQLITE_TEXT:
-            if let text = sqlite3_column_text(statement, index) {
-                return .text(String(decodingCString: text, as: UTF8.self))
+            if let bytes = sqlite3_column_text(statement, index) {
+                // Length-based decode so embedded NULs in TEXT are preserved
+                // (String(decodingCString:) would stop at the first NUL).
+                let count = Int(sqlite3_column_bytes(statement, index))
+                return .text(String(decoding: UnsafeBufferPointer(start: bytes, count: count),
+                                    as: UTF8.self))
             }
             return .text("")
         case SQLITE_BLOB:

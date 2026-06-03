@@ -125,6 +125,10 @@ final class EngineContext: @unchecked Sendable {
 
     // MARK: Hooks (PLAN.md §8)
 
+    /// Known limitation: `sqlite3_update_hook` does not fire for
+    /// `WITHOUT ROWID` tables, so committed *per-row* records exclude writes
+    /// to those tables. The authorizer still records the INSERT/UPDATE/DELETE
+    /// in the attempted stream, which remains the authoritative intent log.
     func recordUpdate(op: Int32, table: String?, rowid: Int64) {
         let opName: String
         switch op {
@@ -147,6 +151,12 @@ final class EngineContext: @unchecked Sendable {
     /// Drop pending rows — the transaction rolled back, so they never
     /// committed. They remain in the *attempted* stream (recorded by the
     /// authorizer), never the committed stream.
+    ///
+    /// Known limitation: this fires only on a full transaction rollback, not
+    /// on `ROLLBACK TO SAVEPOINT` (SQLite exposes no savepoint-execution
+    /// hook), and the pending buffer has no savepoint boundaries. So rows
+    /// written after a savepoint that is later rolled back to may still be
+    /// promoted to the committed stream. The attempted stream is unaffected.
     func rollback() {
         pending.removeAll(keepingCapacity: true)
     }
@@ -162,6 +172,10 @@ final class EngineContext: @unchecked Sendable {
 
     func beginScript(deadlineNanos: UInt64?) {
         self.deadlineNanos = deadlineNanos
+        // Clear any cancellation latched by a previous run's cancellation
+        // handler — otherwise a reused connection would interrupt every
+        // subsequent statement until it is closed.
+        self.cancelled = false
     }
 
     // MARK: Draining

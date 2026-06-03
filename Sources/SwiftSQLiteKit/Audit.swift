@@ -58,16 +58,23 @@ public actor FileAuditSink: AuditSink {
         for event in events {
             blob.append(contentsOf: (event.jsonLine + "\n").utf8)
         }
-        if FileManager.default.fileExists(atPath: url.path) {
-            guard let handle = try? FileHandle(forWritingTo: url) else { return }
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: blob)
-        } else {
-            try? FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true)
-            try? blob.write(to: url)
+        // Append through an O_APPEND stream: one OS-level open that creates
+        // or appends atomically, avoiding the fileExists→write race and the
+        // non-atomic seek+write gap of the FileHandle path.
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        guard let stream = OutputStream(url: url, append: true) else { return }
+        stream.open()
+        defer { stream.close() }
+        blob.withUnsafeBytes { raw in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+            var written = 0
+            while written < blob.count {
+                let n = stream.write(base + written, maxLength: blob.count - written)
+                if n <= 0 { break }
+                written += n
+            }
         }
     }
 }

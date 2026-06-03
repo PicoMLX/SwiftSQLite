@@ -95,7 +95,9 @@ public struct SqliteCommand: ParsableBashCommand {
 
         // --- §4 native-file contract guard (skip for :memory:) ---
         let isMemory = (dbfile == ":memory:")
-        if !isMemory, !backingReachesRealDisk(Shell.bashCurrent.fileSystem) {
+        if !isMemory,
+           !backingIsSupportedForSQLite(Shell.bashCurrent.fileSystem,
+                                        hasSandbox: Shell.bashCurrent.sandbox != nil) {
             Shell.bashCurrent.stderr("""
                 sqlite3: this shell's filesystem is not backed by real disk, \
                 so a database file cannot be opened safely. Use ':memory:' for \

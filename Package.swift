@@ -43,10 +43,11 @@ let package = Package(
                 .define("SQLITE_DEFAULT_FOREIGN_KEYS", to: "1"),
                 .define("SQLITE_OMIT_DEPRECATED"),
                 .define("SQLITE_DEFAULT_MEMSTATUS", to: "0"),
-                // Quiet the amalgamation's own -W noise so SwiftSQLite's
-                // warnings stay signal.
-                .unsafeFlags(["-Wno-unused-but-set-variable",
-                              "-Wno-implicit-fallthrough"]),
+                // NOTE: no .unsafeFlags here — a target that uses unsafe flags
+                // and sits in a product's dependency chain makes that product
+                // unusable as a dependency by downstream SwiftPM packages
+                // (e.g. SwiftBash consuming SwiftSQLite). The amalgamation's
+                // benign warnings are acceptable noise.
             ],
             linkerSettings: [
                 // sqlite3.c calls into libm; Apple links it by default,

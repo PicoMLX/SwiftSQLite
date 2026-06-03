@@ -143,7 +143,8 @@ enum DotCommandRunner {
             let schema = try await connection.query(schemaSQL)
             var tableNames: [String] = []
             for row in schema.rows {
-                guard case let .text(type) = row[0],
+                guard row.count >= 3,
+                      case let .text(type) = row[0],
                       case let .text(name) = row[1],
                       case let .text(create) = row[2] else { continue }
                 out += create + ";\n"
@@ -170,19 +171,22 @@ enum DotCommandRunner {
     private static func tokenize(_ line: String) -> [String] {
         var tokens: [String] = []
         var current = ""
+        var hasToken = false   // distinguishes "no token" from an empty token ("" / '')
         var quote: Character?
         for character in line {
             if let active = quote {
                 if character == active { quote = nil } else { current.append(character) }
             } else if character == "'" || character == "\"" {
                 quote = character
+                hasToken = true
             } else if character == " " || character == "\t" {
-                if !current.isEmpty { tokens.append(current); current = "" }
+                if hasToken { tokens.append(current); current = ""; hasToken = false }
             } else {
                 current.append(character)
+                hasToken = true
             }
         }
-        if !current.isEmpty { tokens.append(current) }
+        if hasToken { tokens.append(current) }
         return tokens
     }
 
@@ -238,9 +242,9 @@ func runSQLSession(
 
     let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
     for line in lines {
-        if line.trimmingCharacters(in: .whitespaces).hasPrefix(".") {
+        if line.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix(".") {
             await flush()
-            switch await DotCommandRunner.run(line.trimmingCharacters(in: .whitespaces),
+            switch await DotCommandRunner.run(line.trimmingCharacters(in: .whitespacesAndNewlines),
                                               connection: connection, state: state) {
             case .ok:
                 break

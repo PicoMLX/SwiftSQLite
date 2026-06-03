@@ -10,27 +10,35 @@ import BashInterpreter
 /// that (recursively) wraps one. Everything else — `InMemoryFileSystem`,
 /// an overlay over memory, any future backing — is refused.
 ///
-/// This guard does **not** replace `sandbox.authorize`, which remains the
-/// real containment boundary (and fails closed for a non-identity mount
-/// whose virtual path escapes the host root). The guard only prevents the
-/// surprising case of silently opening the wrong file under an in-memory
-/// or non-disk backing. (`Shell.fileSystem` is always wrapped in an
-/// `OverlayFileSystem`, so the peel below is required even for the plain
-/// real-disk case.)
-func backingReachesRealDisk(_ fileSystem: any FileSystem) -> Bool {
+/// A `MountedFileSystem` remaps virtual paths to host paths, but its mount
+/// table is private — so we can't confirm virtual==host here. When the
+/// real-disk backing is reached *through* a mount, we therefore require a
+/// `sandbox` gate (`hasSandbox`): under `--sandbox` it re-checks the
+/// symlink-resolved path against the host workspace root, so a non-identity
+/// or out-of-root path **fails closed** (§4) instead of opening the wrong
+/// host file. A plain `RealFileSystem` (no remapping) needs no such gate.
+/// `Shell.fileSystem` is always wrapped in an `OverlayFileSystem`, so the
+/// peel below is required even for the plain real-disk case.
+func backingIsSupportedForSQLite(
+    _ fileSystem: any FileSystem, hasSandbox: Bool
+) -> Bool {
     var current: any FileSystem = fileSystem
+    var passedThroughMount = false
     // Bounded peel of wrapper layers (guards against a pathological cycle).
     for _ in 0..<16 {
-        if current is RealFileSystem { return true }
+        if current is RealFileSystem {
+            return passedThroughMount ? hasSandbox : true
+        }
         if let overlay = current as? OverlayFileSystem {
             current = overlay.backing
             continue
         }
         if let mounted = current as? MountedFileSystem {
+            passedThroughMount = true
             current = mounted.backing
             continue
         }
-        return false
+        return false   // InMemoryFileSystem / unknown → refuse
     }
     return false
 }
