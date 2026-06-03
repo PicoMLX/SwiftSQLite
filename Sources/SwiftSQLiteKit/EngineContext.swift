@@ -9,10 +9,11 @@ import Foundation
 ///
 /// Concurrency: every callback fires **synchronously on the SQL thread**,
 /// i.e. inside the `sqlite3_prepare_v2` / `sqlite3_step` / `sqlite3_exec`
-/// calls the actor makes on its own executor. So all field access happens
-/// on one thread at a time — except `cancelled`, which `onCancel` may set
-/// from another thread (a benign best-effort flag; `sqlite3_interrupt` is
-/// the authoritative abort). Hence `@unchecked Sendable`.
+/// calls the actor makes on its own executor. So all field access happens on
+/// one thread at a time. (Task cancellation is handled purely by
+/// `sqlite3_interrupt`, which is thread-safe, so no flag is shared across
+/// threads here.) `@unchecked Sendable` because the C-pointer plumbing isn't
+/// expressible to the checker.
 final class EngineContext: @unchecked Sendable {
     private let reservedPrefix: String          // lowercased; "" disables
     private let readOnly: Bool
@@ -24,7 +25,6 @@ final class EngineContext: @unchecked Sendable {
     private var pending: [(table: String, rowid: Int64, op: String)] = []
 
     var deadlineNanos: UInt64?
-    var cancelled: Bool = false
 
     init(reservedTablePrefix: String, readOnly: Bool) {
         self.reservedPrefix = reservedTablePrefix.lowercased()
@@ -167,7 +167,6 @@ final class EngineContext: @unchecked Sendable {
     // MARK: Timeout / cancellation
 
     func isExpired() -> Bool {
-        if cancelled { return true }
         if let deadline = deadlineNanos,
            DispatchTime.now().uptimeNanoseconds > deadline { return true }
         return false
@@ -175,10 +174,6 @@ final class EngineContext: @unchecked Sendable {
 
     func beginScript(deadlineNanos: UInt64?) {
         self.deadlineNanos = deadlineNanos
-        // Clear any cancellation latched by a previous run's cancellation
-        // handler — otherwise a reused connection would interrupt every
-        // subsequent statement until it is closed.
-        self.cancelled = false
     }
 
     // MARK: Draining

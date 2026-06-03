@@ -64,18 +64,33 @@ public actor FileAuditSink: AuditSink {
         try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true)
-        guard let stream = OutputStream(url: url, append: true) else { return }
+        guard let stream = OutputStream(url: url, append: true) else {
+            Self.reportFailure(url: url, error: nil)
+            return
+        }
         stream.open()
         defer { stream.close() }
+        var failure: Error? = stream.streamError
         blob.withUnsafeBytes { raw in
             guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
             var written = 0
             while written < blob.count {
                 let n = stream.write(base + written, maxLength: blob.count - written)
-                if n <= 0 { break }
+                if n <= 0 { failure = stream.streamError ?? failure; return }
                 written += n
             }
         }
+        if let failure { Self.reportFailure(url: url, error: failure) }
+    }
+
+    /// Surface an audit-write failure to stderr rather than silently dropping
+    /// records — the audit trail matters most exactly when writes fail (full
+    /// disk, I/O error). Kept to a diagnostic since `record` can't throw
+    /// (it runs after the SQL has already committed).
+    private static func reportFailure(url: URL, error: Error?) {
+        let reason = error.map { String(describing: $0) } ?? "could not open audit file"
+        let line = "SwiftSQLite: AUDIT WRITE FAILED for \(url.path): \(reason)\n"
+        FileHandle.standardError.write(Data(line.utf8))
     }
 }
 

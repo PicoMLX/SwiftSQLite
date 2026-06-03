@@ -132,7 +132,10 @@ enum DotCommandRunner {
 
     private static func dump(_ connection: SQLiteConnection, only: String?) async -> DotResult {
         do {
-            var out = "PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n"
+            // No `PRAGMA foreign_keys=OFF;` here: replaying the dump through
+            // this sandboxed command would hit the all-PRAGMA-denied
+            // authorizer. The whole restore runs in one transaction instead.
+            var out = "BEGIN TRANSACTION;\n"
             var schemaSQL = "SELECT type, name, sql FROM sqlite_schema "
                 + "WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
             if let only {
@@ -142,13 +145,21 @@ enum DotCommandRunner {
 
             let schema = try await connection.query(schemaSQL)
             var tableNames: [String] = []
+            var deferredSchema: [String] = []   // indexes/triggers/views, emitted last
             for row in schema.rows {
                 guard row.count >= 3,
                       case let .text(type) = row[0],
                       case let .text(name) = row[1],
                       case let .text(create) = row[2] else { continue }
-                out += create + ";\n"
-                if type == "table" { tableNames.append(name) }
+                if type == "table" {
+                    out += create + ";\n"
+                    tableNames.append(name)
+                } else {
+                    // Defer indexes/triggers/views until after the data so a
+                    // restore doesn't fire AFTER-INSERT triggers while the
+                    // dumped rows are being replayed.
+                    deferredSchema.append(create + ";\n")
+                }
             }
             for table in tableNames {
                 let rows = try await connection.query("SELECT * FROM \"\(escapeIdentifier(table))\";")
@@ -158,6 +169,7 @@ enum DotCommandRunner {
                     out += "INSERT INTO \(identifier) VALUES(\(values));\n"
                 }
             }
+            out += deferredSchema.joined()
             out += "COMMIT;\n"
             Shell.bashCurrent.stdout(out)
             return .ok

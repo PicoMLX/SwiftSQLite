@@ -103,7 +103,11 @@ enum ResultRenderer {
         switch value {
         case .null: return NSNull()
         case .integer(let i): return i
-        case .real(let d): return d
+        case .real(let d):
+            // JSON (and JSONSerialization) can't represent Infinity/NaN; emit
+            // them as strings so a single non-finite cell doesn't make the
+            // whole result set fail to serialize.
+            return d.isFinite ? d : String(d)
         case .text(let s): return s
         case .blob(let data): return data.base64EncodedString()
         }

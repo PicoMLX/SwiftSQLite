@@ -118,7 +118,10 @@ public struct SqliteCommand: ParsableBashCommand {
         do {
             if isMemory {
                 databasePath = ":memory:"
-                connection = try await SQLiteConnection(inMemory: policy, audit: InMemoryAuditSink())
+                let sink = await makeAuditSink(
+                    enabled: auditEnabled, explicitPath: auditPath,
+                    databaseURL: nil, shell: shell)
+                connection = try await SQLiteConnection(inMemory: policy, audit: sink)
             } else {
                 let resolved = shell.resolvePath(dbfile)
                 databasePath = resolved
@@ -172,12 +175,20 @@ public struct SqliteCommand: ParsableBashCommand {
     /// too; if denied, audit is downgraded to in-memory (the command still
     /// runs) rather than failing.
     private func makeAuditSink(
-        enabled: Bool, explicitPath: String?, databaseURL: URL, shell: Shell
+        enabled: Bool, explicitPath: String?, databaseURL: URL?, shell: Shell
     ) async -> any AuditSink {
         guard enabled else { return InMemoryAuditSink() }
-        let auditURL = explicitPath
-            .map { URL(fileURLWithPath: shell.resolvePath($0)) }
-            ?? databaseURL.appendingPathExtension("audit.log")
+        // Explicit -audit PATH wins (honored even for :memory:); otherwise
+        // default to a `<db>.audit.log` sibling for file DBs. An in-memory DB
+        // with no explicit path has nowhere persistent to write.
+        let auditURL: URL
+        if let explicitPath {
+            auditURL = URL(fileURLWithPath: shell.resolvePath(explicitPath))
+        } else if let databaseURL {
+            auditURL = databaseURL.appendingPathExtension("audit.log")
+        } else {
+            return InMemoryAuditSink()
+        }
         do {
             try await shell.sandbox?.authorize(auditURL)
             return FileAuditSink(url: auditURL)

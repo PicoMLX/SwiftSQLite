@@ -87,14 +87,15 @@ public actor SQLiteConnection {
             ? nil
             : DispatchTime.now().uptimeNanoseconds &+ timeoutNanos)
 
-        // Capture Sendable references for the cancellation handler.
+        // Capture a Sendable reference for the cancellation handler.
         let handle = self.handle
-        let ctx = self.ctx
         do {
             let result = try await withTaskCancellationHandler {
                 try handle.runScript(sql)
             } onCancel: {
-                ctx.cancelled = true   // best-effort; sqlite3_interrupt is authoritative
+                // sqlite3_interrupt is thread-safe (SQLITE_THREADSAFE=1) and
+                // makes the in-flight step return SQLITE_INTERRUPT. No shared
+                // Swift flag is needed (avoids a cross-thread data race).
                 handle.interrupt()
             }
             await flushAudit()
@@ -144,9 +145,9 @@ public actor SQLiteConnection {
 /// `OpaquePointer` never trips Swift 6 actor-isolation / data-race checks. The
 /// owning `SQLiteConnection` actor serializes all access, and the C callbacks
 /// fire synchronously on that same executor thread — so the access is
-/// single-threaded in practice. `cancelled` may be set from another thread by
-/// the cancellation handler (a benign flag; `sqlite3_interrupt` is the real
-/// mechanism, and is thread-safe with `SQLITE_THREADSAFE=1`).
+/// single-threaded in practice. The one exception is `interrupt()`, which the
+/// cancellation handler may call from another thread; `sqlite3_interrupt` is
+/// documented thread-safe with `SQLITE_THREADSAFE=1`.
 private final class ConnectionHandle: @unchecked Sendable {
     private var db: OpaquePointer?
     private let location: String
