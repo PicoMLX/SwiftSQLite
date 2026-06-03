@@ -175,6 +175,18 @@ enum DotCommandRunner {
             }
             for table in tableNames {
                 let rows = try await connection.query("SELECT * FROM \"\(escapeIdentifier(table))\";")
+                if rows.truncated {
+                    // The per-query row cap (EnginePolicy.rowLimit) is a safety
+                    // guard, but for an export it would silently drop rows
+                    // behind a valid-looking COMMIT — and `.dump` is the only
+                    // export-like command left enabled in the sandbox, so a
+                    // truncated dump replays as silent data loss. Fail loudly
+                    // instead of emitting an incomplete dump.
+                    return .failed(
+                        "table \"\(table)\" exceeds the \(connection.rowLimit)-row "
+                        + "export cap; .dump aborted to avoid silently producing "
+                        + "an incomplete dump")
+                }
                 let identifier = "\"\(escapeIdentifier(table))\""
                 for row in rows.rows {
                     let values = row.map(sqlLiteral).joined(separator: ",")
@@ -266,9 +278,15 @@ func runSQLSession(
 
     let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
     for line in lines {
-        if line.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix(".") {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Only treat a leading-dot line as a dot-command at a statement
+        // boundary. Inside an unfinished statement — e.g. a multi-line string
+        // literal whose data has a line starting with '.' — the dot is data,
+        // not a command (matching the real sqlite3 REPL, which checks for
+        // dot-commands only when no SQL is pending).
+        if trimmed.hasPrefix(".") && SQLiteSQL.isAtStatementBoundary(sqlBuffer) {
             await flush()
-            switch await DotCommandRunner.run(line.trimmingCharacters(in: .whitespacesAndNewlines),
+            switch await DotCommandRunner.run(trimmed,
                                               connection: connection, state: state) {
             case .ok:
                 break

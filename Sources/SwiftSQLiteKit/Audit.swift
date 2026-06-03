@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// A single audit record. Two tiers (PLAN.md §8):
 /// - `attempted` comes from the authorizer at *prepare* time — it proves
@@ -42,9 +47,17 @@ public actor InMemoryAuditSink: AuditSink {
     public var committed: [AuditEvent] { events.filter(\.isCommitted) }
 }
 
+/// Carries an `errno`-derived message into `reportFailure`'s diagnostic.
+private struct AuditWriteError: Error, CustomStringConvertible {
+    let message: String
+    var description: String { message }
+}
+
 /// An `AuditSink` that appends one JSON object per event (JSON Lines) to a
 /// host file. The file lives outside the DB, so the trail survives a
-/// `DROP TABLE` of the audited data.
+/// `DROP TABLE` of the audited data. The append uses a raw O_NOFOLLOW open so
+/// a symlink swapped in after the path was authorized can't redirect it
+/// outside the sandbox.
 public actor FileAuditSink: AuditSink {
     private let url: URL
 
@@ -58,29 +71,42 @@ public actor FileAuditSink: AuditSink {
         for event in events {
             blob.append(contentsOf: (event.jsonLine + "\n").utf8)
         }
-        // Append through an O_APPEND stream: one OS-level open that creates
-        // or appends atomically, avoiding the fileExists→write race and the
-        // non-atomic seek+write gap of the FileHandle path.
         try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true)
-        guard let stream = OutputStream(url: url, append: true) else {
-            Self.reportFailure(url: url, error: nil)
+        // Open with O_NOFOLLOW so a post-authorization swap of the audit path
+        // to a symlink can't redirect the append outside the sandbox — the path
+        // was authorized earlier, and this is the syscall-level backstop, the
+        // audit-log counterpart of the DB open's NOFOLLOW. O_NOFOLLOW rejects a
+        // symlinked *final* component, which is all that's needed here: the leaf
+        // is the log file we create and append to. O_APPEND keeps each flush
+        // atomic; O_CREAT makes the first write create it (mode 0600).
+        let fd = url.path.withCString {
+            open($0, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0o600)
+        }
+        guard fd >= 0 else {
+            Self.reportFailure(url: url, error: Self.errnoError())
             return
         }
-        stream.open()
-        defer { stream.close() }
-        var failure: Error? = stream.streamError
-        blob.withUnsafeBytes { raw in
-            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+        defer { close(fd) }
+        var failure: Error?
+        blob.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
             var written = 0
-            while written < blob.count {
-                let n = stream.write(base + written, maxLength: blob.count - written)
-                if n <= 0 { failure = stream.streamError ?? failure; return }
+            while written < raw.count {
+                let n = write(fd, base + written, raw.count - written)
+                if n <= 0 { failure = Self.errnoError(); return }
                 written += n
             }
         }
         if let failure { Self.reportFailure(url: url, error: failure) }
+    }
+
+    /// Snapshot the current `errno` as a human-readable error for
+    /// `reportFailure` (e.g. "Too many levels of symbolic links" when a
+    /// swapped-in symlink trips O_NOFOLLOW).
+    private static func errnoError() -> Error {
+        AuditWriteError(message: String(cString: strerror(errno)))
     }
 
     /// Surface an audit-write failure to stderr rather than silently dropping

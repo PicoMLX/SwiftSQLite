@@ -1,6 +1,11 @@
 import CSQLite
 import Dispatch
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 /// A serialized connection to one SQLite database, hardened for running
 /// untrusted SQL inside a sandbox (PLAN.md §3, §5, §7).
@@ -20,6 +25,11 @@ public actor SQLiteConnection {
     private let audit: any AuditSink
     private let ctx: EngineContext
     private var isClosed = false
+
+    /// The per-query row cap (`EnginePolicy.rowLimit`). Exposed so callers
+    /// like `.dump` can detect and report an export that would exceed it,
+    /// instead of silently emitting a truncated-but-valid-looking result.
+    public nonisolated var rowLimit: Int { policy.rowLimit }
 
     /// A connection to the file at `url` (a HOST file URL — the caller is
     /// responsible for resolution and sandboxing). `authorize` is invoked
@@ -169,17 +179,30 @@ private final class ConnectionHandle: @unchecked Sendable {
     func open() throws {
         var opened: OpaquePointer?
         // No SQLITE_OPEN_URI — file: URI tricks are off here and at compile
-        // time (SQLITE_USE_URI=0). SQLITE_OPEN_NOFOLLOW is intentionally NOT
-        // set: it rejects any path containing a symlinked component, which
-        // breaks legitimate opens on macOS (temp/app dirs live under
-        // /var → /private/var). The symlink-escape defense is the caller's
-        // sandbox.authorize, which re-checks the symlink-resolved path against
-        // the workspace root (§4 / §5 step 1).
-        let flags: Int32 = policy.readOnly
+        // time (SQLITE_USE_URI=0).
+        var flags: Int32 = policy.readOnly
             ? SQLITE_OPEN_READONLY
             : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
 
-        let rc = sqlite3_open_v2(location, &opened, flags, nil)
+        // Symlink-swap backstop (§5 step 1). `sandbox.authorize` already checks
+        // the symlink-resolved path against the workspace root — but that's a
+        // check-then-open (TOCTOU): a component swapped to a symlink *after*
+        // authorization and *before* this open would otherwise escape the tree.
+        // SQLITE_OPEN_NOFOLLOW closes that race — SQLite fails the open if it
+        // walks ANY symlinked path component (unixFullPathname → nSymlink). To
+        // keep it from tripping on *legitimate* system symlinks (macOS temp/app
+        // dirs live under /var → /private/var), canonicalize the path first: a
+        // fully-resolved path has no symlinks left to count, so NOFOLLOW only
+        // fires on a *post-resolution* swap — exactly the window we're closing.
+        let openPath: String
+        if location == ":memory:" {
+            openPath = location
+        } else {
+            openPath = Self.canonicalOpenPath(location)
+            flags |= SQLITE_OPEN_NOFOLLOW
+        }
+
+        let rc = sqlite3_open_v2(openPath, &opened, flags, nil)
         if rc != SQLITE_OK {
             let message = opened.map { String(cString: sqlite3_errmsg($0)) }
                 ?? "unable to open database"
@@ -190,6 +213,30 @@ private final class ConnectionHandle: @unchecked Sendable {
             throw SQLiteError(code: rc, message: "open returned no handle")
         }
         db = opened
+    }
+
+    /// Canonicalize `path` so SQLITE_OPEN_NOFOLLOW won't reject legitimate
+    /// symlinks in the path while still catching a post-authorization swap.
+    /// An existing file resolves whole; for a not-yet-created DB the leaf has
+    /// nothing to resolve, so canonicalize the parent dir and re-attach the
+    /// leaf. Falls back to the original path if neither resolves (the open
+    /// then fails closed via SQLite).
+    private static func canonicalOpenPath(_ path: String) -> String {
+        if let resolved = realpathOrNil(path) { return resolved }
+        let url = URL(fileURLWithPath: path)
+        if let parent = realpathOrNil(url.deletingLastPathComponent().path) {
+            return (parent as NSString)
+                .appendingPathComponent(url.lastPathComponent)
+        }
+        return path
+    }
+
+    /// POSIX `realpath(3)` wrapper: the fully symlink-resolved path, or nil if
+    /// `path` can't be resolved (e.g. it doesn't exist yet).
+    private static func realpathOrNil(_ path: String) -> String? {
+        guard let c = realpath(path, nil) else { return nil }
+        defer { free(c) }
+        return String(cString: c)
     }
 
     /// Runtime hardening + the pragmas we need, then install the authorizer

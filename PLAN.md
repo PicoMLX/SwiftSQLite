@@ -65,10 +65,10 @@ SwiftBash's `FileSystem` protocol is whole-file, so SQLite can't go through it �
 ```
 resolved = Shell.current.resolvePath(argvPath)          // lexical; ~ + cwd + ./.. only (Shell+Path.swift:20)
 try await Shell.current.sandbox?.authorize(URL(fileURLWithPath: resolved))   // symlink-resolved containment check
-sqlite3_open_v2(resolved, &db, flags | SQLITE_OPEN_NOFOLLOW, vfs)            // open the SAME string
+sqlite3_open_v2(realpath(resolved), &db, flags | SQLITE_OPEN_NOFOLLOW, vfs)  // canonicalize, then open w/ NOFOLLOW
 ```
 
-- `resolvePath` is **lexical and does not resolve symlinks** (`Shell+Path.swift:13-14, 57-66`) — that's fine: the **symlink-escape defense lives in `sandbox.authorize`**, which re-checks the symlink-resolved path against the mount root (`Sandbox+BashWorkspace.swift:57-74`), and `SQLITE_OPEN_NOFOLLOW` adds a syscall-level backstop. Authorize and open the **same** `resolved` string → no "authorize-one-path/open-another" gap.
+- `resolvePath` is **lexical and does not resolve symlinks** (`Shell+Path.swift:13-14, 57-66`) — that's fine: the **symlink-escape defense lives in `sandbox.authorize`**, which re-checks the symlink-resolved path against the mount root (`Sandbox+BashWorkspace.swift:57-74`). `SQLITE_OPEN_NOFOLLOW` adds a syscall-level backstop against a component swapped to a symlink *after* authorization. SQLite counts **every** symlinked component (`unixFullPathname` → `nSymlink`), so a naive `NOFOLLOW` open rejects legitimate system symlinks (macOS `/var → /private/var`); the open therefore **canonicalizes** the path first (`realpath`), and `NOFOLLOW` then fires only on a *post-canonicalization* swap. `authorize` resolves symlinks too, so both still target the **same real file** → no "authorize-one-path/open-another" gap.
 - **Engine API** takes a host `URL` directly (per the "caller passes a sandboxed file URL" decision), so it never touches this resolution at all.
 
 **Supported configurations & fail-closed behavior:**

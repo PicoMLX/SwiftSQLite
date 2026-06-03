@@ -72,8 +72,12 @@ error** (never silently ignored): `.shell`, `.system`, `.import`,
 ## Security model (summary)
 
 1. **Gate the open** — the command resolves the path, calls
-   `sandbox.authorize` (symlink-resolved containment), then opens that
-   exact string with `SQLITE_OPEN_NOFOLLOW` and no URI parsing (PLAN.md §4).
+   `sandbox.authorize` (symlink-resolved containment), then opens it with
+   `SQLITE_OPEN_NOFOLLOW` and no URI parsing. The path is canonicalized
+   first, so `NOFOLLOW` guards against a component swapped to a symlink
+   *after* authorization rather than tripping on legitimate system symlinks
+   (e.g. macOS `/var → /private/var`, which SQLite would otherwise reject —
+   it counts every symlinked component) (PLAN.md §4).
 2. **Pin auxiliary files** — `temp_store=MEMORY`; WAL/journal/shm are
    in-directory siblings.
 3. **Close the SQL escape hatches** — `load_extension()` compiled out,
@@ -84,7 +88,9 @@ error** (never silently ignored): `.shell`, `.system`, `.import`,
 4. **Audit everything** — the authorizer records every *attempted*
    operation (intent, including denied/rolled-back); the commit + update
    hooks record every *committed* row. The audit log is written **outside**
-   the database, so a `DROP`/`DELETE` cannot erase its own trail.
+   the database (opened `O_NOFOLLOW` too, so it can't be redirected by a
+   symlink swapped in after its path was authorized), so a `DROP`/`DELETE`
+   cannot erase its own trail.
 
 ## Engine API (SwiftBash-agnostic)
 
