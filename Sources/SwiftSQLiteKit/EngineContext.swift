@@ -82,7 +82,11 @@ final class EngineContext: @unchecked Sendable {
              SQLITE_DROP_INDEX, SQLITE_DROP_TEMP_INDEX,
              SQLITE_DROP_VIEW, SQLITE_DROP_TEMP_VIEW,
              SQLITE_DROP_TRIGGER, SQLITE_DROP_TEMP_TRIGGER,
-             SQLITE_ALTER_TABLE:
+             SQLITE_ALTER_TABLE,
+             // REINDEX/ANALYZE are safe maintenance on the one DB file —
+             // and CREATE INDEX reports the index build to the authorizer as
+             // SQLITE_REINDEX, so denying it breaks CREATE INDEX.
+             SQLITE_REINDEX, SQLITE_ANALYZE:
             if readOnly { return SQLITE_DENY }
             // `sqlite_schema` writes are deliberately NOT denied here:
             // legitimate DDL (CREATE/DROP/ALTER) is reported to the
