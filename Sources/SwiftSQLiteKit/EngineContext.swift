@@ -48,8 +48,13 @@ final class EngineContext: @unchecked Sendable {
     private func decide(action: Int32, arg1: String?, arg2: String?) -> Int32 {
         let object = guardedObjectName(action: action, arg1: arg1, arg2: arg2)
 
-        // The reserved audit namespace is hidden from user SQL entirely
-        // (read *and* write), so it can be neither inspected nor forged.
+        // The reserved audit namespace is denied to user SQL for reads *and*
+        // writes of the object itself, so an `_audit*` table's rows can be
+        // neither queried nor forged. (Catalog metadata is NOT row-filtered:
+        // a `SELECT … FROM sqlite_schema` can still reveal that such an object
+        // exists and its DDL — `SQLITE_READ` fires for `sqlite_schema`, not the
+        // reserved object. A deliberate limitation; the audit trail itself is
+        // an external file, not an in-DB `_audit*` table.)
         if isReserved(object) { return SQLITE_DENY }
 
         switch action {

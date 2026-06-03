@@ -113,24 +113,31 @@ public struct SqliteCommand: ParsableBashCommand {
         policy.readOnly = readOnly
 
         let shell = Shell.bashCurrent   // captured for the @Sendable authorize closure
+        let resolved = isMemory ? ":memory:" : shell.resolvePath(dbfile)
+        let databasePath = resolved
+
+        // Build the audit sink first. An explicit `-audit PATH` the sandbox
+        // denies fails the command: when the user asked for a persistent trail
+        // we refuse to run (possibly destructive) SQL unaudited. A denied
+        // *default* sibling path downgrades to in-memory inside makeAuditSink.
+        let sink: any AuditSink
+        do {
+            sink = try await makeAuditSink(
+                enabled: auditEnabled, explicitPath: auditPath,
+                databaseURL: isMemory ? nil : URL(fileURLWithPath: resolved),
+                shell: shell)
+        } catch {
+            Shell.bashCurrent.stderr("sqlite3: \(errorText(error))\n")
+            return .failure
+        }
+
         let connection: SQLiteConnection
-        let databasePath: String
         do {
             if isMemory {
-                databasePath = ":memory:"
-                let sink = await makeAuditSink(
-                    enabled: auditEnabled, explicitPath: auditPath,
-                    databaseURL: nil, shell: shell)
                 connection = try await SQLiteConnection(inMemory: policy, audit: sink)
             } else {
-                let resolved = shell.resolvePath(dbfile)
-                databasePath = resolved
-                let databaseURL = URL(fileURLWithPath: resolved)
-                let sink = await makeAuditSink(
-                    enabled: auditEnabled, explicitPath: auditPath,
-                    databaseURL: databaseURL, shell: shell)
                 connection = try await SQLiteConnection(
-                    url: databaseURL,
+                    url: URL(fileURLWithPath: resolved),
                     policy: policy,
                     audit: sink,
                     authorize: { url, _ in
@@ -171,21 +178,25 @@ public struct SqliteCommand: ParsableBashCommand {
 
     /// Build the audit sink (writes JSON Lines **outside** the DB). The
     /// default path is a `<db>.audit.log` sibling, which lives inside the
-    /// already-authorized directory. An explicit `-audit` path is authorized
-    /// too; if denied, audit is downgraded to in-memory (the command still
-    /// runs) rather than failing.
+    /// already-authorized directory. An explicit `-audit PATH` is authorized
+    /// too; if **that** is denied this throws (the caller fails the command,
+    /// since the user explicitly asked for a persistent trail). A denied
+    /// *default* sibling path downgrades to in-memory and the command runs.
     private func makeAuditSink(
         enabled: Bool, explicitPath: String?, databaseURL: URL?, shell: Shell
-    ) async -> any AuditSink {
+    ) async throws -> any AuditSink {
         guard enabled else { return InMemoryAuditSink() }
         // Explicit -audit PATH wins (honored even for :memory:); otherwise
         // default to a `<db>.audit.log` sibling for file DBs. An in-memory DB
         // with no explicit path has nowhere persistent to write.
         let auditURL: URL
+        let isExplicit: Bool
         if let explicitPath {
             auditURL = URL(fileURLWithPath: shell.resolvePath(explicitPath))
+            isExplicit = true
         } else if let databaseURL {
             auditURL = databaseURL.appendingPathExtension("audit.log")
+            isExplicit = false
         } else {
             return InMemoryAuditSink()
         }
@@ -193,10 +204,23 @@ public struct SqliteCommand: ParsableBashCommand {
             try await shell.sandbox?.authorize(auditURL)
             return FileAuditSink(url: auditURL)
         } catch {
+            if isExplicit {
+                // Fail closed: don't run unaudited when a persistent trail was
+                // explicitly requested.
+                throw AuditPathDenied(
+                    message: "-audit path denied: \(errorText(error))")
+            }
             shell.stderr("sqlite3: audit log disabled (path denied): \(errorText(error))\n")
             return InMemoryAuditSink()
         }
     }
+}
+
+/// Thrown when an explicitly-requested `-audit PATH` is denied by the sandbox,
+/// so the command fails closed instead of running unaudited.
+private struct AuditPathDenied: Error, CustomStringConvertible {
+    let message: String
+    var description: String { message }
 }
 
 private let usageText = """

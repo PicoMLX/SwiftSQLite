@@ -55,4 +55,26 @@ struct ContractGuardTests {
             #expect(!result.status.isSuccess)
         }
     }
+
+    /// An explicitly-requested `-audit PATH` that the sandbox denies must fail
+    /// the command — not silently downgrade to in-memory and run the SQL
+    /// unaudited. The DB itself is inside the workspace (it would open fine).
+    @Test func explicitAuditPathDeniedFailsClosed() async throws {
+        try await withTempDirectory { workspace in
+            let shell = Shell(
+                fileSystem: MountedFileSystem(
+                    mounts: [.init(virtual: workspace, host: workspace)],
+                    backing: RealFileSystem()),
+                environment: Environment(variables: [:], workingDirectory: workspace))
+            shell.sandbox = Sandbox.bashWorkspace(workspace: workspace)
+            shell.installShellBuiltin(SqliteCommand.self)
+
+            let result = try await runCapturing(
+                shell,
+                "sqlite3 -audit /etc/swiftsqlite-evil-audit.log "
+                    + "\(workspace)/t.db 'CREATE TABLE t(x);'")
+            #expect(!result.status.isSuccess)
+            #expect(result.stderr.contains("audit"), "stderr: \(result.stderr)")
+        }
+    }
 }

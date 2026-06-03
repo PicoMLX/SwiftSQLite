@@ -79,4 +79,42 @@ struct DumpAndParsingTests {
         #expect(result.status.isSuccess, "stderr: \(result.stderr)")
         #expect(result.stdout.contains("alpha"))
     }
+
+    // MARK: .dump fidelity
+
+    /// `.dump` must preserve the AUTOINCREMENT high-water mark by emitting
+    /// `sqlite_sequence`, so a restore doesn't reuse a freed id.
+    @Test func dumpPreservesAutoincrementSequence() async throws {
+        let shell = Shell()
+        shell.installShellBuiltin(SqliteCommand.self)
+        let script = """
+            CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+            INSERT INTO t(v) VALUES ('a'),('b'),('c');
+            DELETE FROM t WHERE id=3;
+            .dump
+            """
+        let result = try await runCapturing(shell, "sqlite3 :memory:",
+                                            stdin: script)
+        #expect(result.status.isSuccess, "stderr: \(result.stderr)")
+        #expect(result.stdout.contains("INSERT INTO sqlite_sequence"),
+                "dump should carry the AUTOINCREMENT counter:\n\(result.stdout)")
+    }
+
+    /// A TEXT value with an embedded NUL must be dumped NUL-safely (a hex blob
+    /// cast), not as a raw quoted literal that would truncate the replayed
+    /// script at the NUL.
+    @Test func dumpEncodesEmbeddedNulSafely() async throws {
+        let shell = Shell()
+        shell.installShellBuiltin(SqliteCommand.self)
+        let script = """
+            CREATE TABLE t(x);
+            INSERT INTO t(x) VALUES('a' || char(0) || 'b');
+            .dump
+            """
+        let result = try await runCapturing(shell, "sqlite3 :memory:",
+                                            stdin: script)
+        #expect(result.status.isSuccess, "stderr: \(result.stderr)")
+        #expect(result.stdout.contains("CAST(x'"),
+                "NUL-bearing TEXT should dump as a hex-blob cast:\n\(result.stdout)")
+    }
 }

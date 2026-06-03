@@ -74,13 +74,16 @@ public actor FileAuditSink: AuditSink {
         try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true)
-        // Open with O_NOFOLLOW so a post-authorization swap of the audit path
-        // to a symlink can't redirect the append outside the sandbox — the path
-        // was authorized earlier, and this is the syscall-level backstop, the
-        // audit-log counterpart of the DB open's NOFOLLOW. O_NOFOLLOW rejects a
-        // symlinked *final* component, which is all that's needed here: the leaf
-        // is the log file we create and append to. O_APPEND keeps each flush
-        // atomic; O_CREAT makes the first write create it (mode 0600).
+        // Open with O_NOFOLLOW so a swap of the audit log's *final* component
+        // to a symlink after its path was authorized can't redirect the append
+        // outside the sandbox. NOTE the deliberate limitation: POSIX O_NOFOLLOW
+        // guards only the leaf, so a *parent directory* swapped to a symlink
+        // after authorization is still followed here. Closing that race needs
+        // openat-style walking from a trusted root fd — deferred to M7 (PLAN
+        // §11: per-open symlink enforcement is defense-in-depth, and the file
+        // set is already closed by the authorizer + LIMIT_ATTACHED=0 +
+        // defensive mode). O_APPEND keeps each flush atomic; O_CREAT creates
+        // the log on first write (mode 0600).
         let fd = url.path.withCString {
             open($0, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0o600)
         }

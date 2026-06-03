@@ -54,10 +54,18 @@ public actor SQLiteConnection {
             reservedTablePrefix: policy.reservedTablePrefix,
             readOnly: policy.readOnly)
         self.ctx = ctx
-        self.handle = ConnectionHandle(location: url.path, policy: policy, ctx: ctx)
+        // Canonicalize ONCE, before authorize, so the authorized path and the
+        // opened path are the same fully symlink-resolved string. NOFOLLOW (in
+        // open()) then guards that exact path against a component being swapped
+        // to a symlink afterwards. Resolving *after* authorize would instead
+        // follow such a swap and defeat NOFOLLOW (the TOCTOU window). authorize
+        // does symlink-resolved containment, so feeding it the already-resolved
+        // path yields the same decision with no resolve-after-check gap.
+        let canonicalPath = ConnectionHandle.canonicalize(url.path)
+        self.handle = ConnectionHandle(location: canonicalPath, policy: policy, ctx: ctx)
 
         let intent: AccessIntent = policy.readOnly ? .read : .create
-        try await authorize(url, intent)
+        try await authorize(URL(fileURLWithPath: canonicalPath), intent)
         try handle.open()
         try handle.configure()
     }
@@ -184,25 +192,20 @@ private final class ConnectionHandle: @unchecked Sendable {
             ? SQLITE_OPEN_READONLY
             : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
 
-        // Symlink-swap backstop (§5 step 1). `sandbox.authorize` already checks
-        // the symlink-resolved path against the workspace root — but that's a
-        // check-then-open (TOCTOU): a component swapped to a symlink *after*
-        // authorization and *before* this open would otherwise escape the tree.
-        // SQLITE_OPEN_NOFOLLOW closes that race — SQLite fails the open if it
-        // walks ANY symlinked path component (unixFullPathname → nSymlink). To
-        // keep it from tripping on *legitimate* system symlinks (macOS temp/app
-        // dirs live under /var → /private/var), canonicalize the path first: a
-        // fully-resolved path has no symlinks left to count, so NOFOLLOW only
-        // fires on a *post-resolution* swap — exactly the window we're closing.
-        let openPath: String
-        if location == ":memory:" {
-            openPath = location
-        } else {
-            openPath = Self.canonicalOpenPath(location)
+        // `location` was canonicalized BEFORE authorize (see
+        // SQLiteConnection.init), so it is symlink-free and byte-identical to
+        // the authorized path. Adding SQLITE_OPEN_NOFOLLOW makes SQLite fail
+        // the open if ANY component of that path has since become a symlink
+        // (unixFullPathname counts every component → nSymlink): a clean
+        // canonical path passes, and a component swapped to a symlink *after*
+        // authorization is rejected. Canonicalizing here instead would re-
+        // resolve and silently *follow* such a swap — defeating NOFOLLOW — so
+        // it must happen before authorize, not now. :memory: is exempt.
+        if location != ":memory:" {
             flags |= SQLITE_OPEN_NOFOLLOW
         }
 
-        let rc = sqlite3_open_v2(openPath, &opened, flags, nil)
+        let rc = sqlite3_open_v2(location, &opened, flags, nil)
         if rc != SQLITE_OK {
             let message = opened.map { String(cString: sqlite3_errmsg($0)) }
                 ?? "unable to open database"
@@ -215,13 +218,15 @@ private final class ConnectionHandle: @unchecked Sendable {
         db = opened
     }
 
-    /// Canonicalize `path` so SQLITE_OPEN_NOFOLLOW won't reject legitimate
-    /// symlinks in the path while still catching a post-authorization swap.
-    /// An existing file resolves whole; for a not-yet-created DB the leaf has
-    /// nothing to resolve, so canonicalize the parent dir and re-attach the
-    /// leaf. Falls back to the original path if neither resolves (the open
-    /// then fails closed via SQLite).
-    private static func canonicalOpenPath(_ path: String) -> String {
+    /// Fully symlink-resolve `path` so it can be both authorized and opened as
+    /// one identical string, and so SQLITE_OPEN_NOFOLLOW (which rejects a path
+    /// with any symlinked component) won't trip on legitimate system symlinks
+    /// (macOS `/var → /private/var`). Called *before* authorize. An existing
+    /// file resolves whole; for a not-yet-created DB the leaf has nothing to
+    /// resolve, so canonicalize the parent dir and re-attach the leaf. Falls
+    /// back to the original path if neither resolves (the open then fails
+    /// closed via SQLite / authorize).
+    fileprivate static func canonicalize(_ path: String) -> String {
         if let resolved = realpathOrNil(path) { return resolved }
         let url = URL(fileURLWithPath: path)
         if let parent = realpathOrNil(url.deletingLastPathComponent().path) {

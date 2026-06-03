@@ -63,12 +63,13 @@ SwiftBash's `FileSystem` protocol is whole-file, so SQLite can't go through it �
 **SQLite's contract (CLI surface):**
 
 ```
-resolved = Shell.current.resolvePath(argvPath)          // lexical; ~ + cwd + ./.. only (Shell+Path.swift:20)
-try await Shell.current.sandbox?.authorize(URL(fileURLWithPath: resolved))   // symlink-resolved containment check
-sqlite3_open_v2(realpath(resolved), &db, flags | SQLITE_OPEN_NOFOLLOW, vfs)  // canonicalize, then open w/ NOFOLLOW
+resolved  = Shell.current.resolvePath(argvPath)   // lexical; ~ + cwd + ./.. only (Shell+Path.swift:20)
+canonical = realpath(resolved)                    // resolve symlinks ONCE, in the engine, BEFORE authorize
+try await Shell.current.sandbox?.authorize(URL(fileURLWithPath: canonical))   // containment on the resolved path
+sqlite3_open_v2(canonical, &db, flags | SQLITE_OPEN_NOFOLLOW, vfs)            // open the SAME path; NOFOLLOW catches later swaps
 ```
 
-- `resolvePath` is **lexical and does not resolve symlinks** (`Shell+Path.swift:13-14, 57-66`) — that's fine: the **symlink-escape defense lives in `sandbox.authorize`**, which re-checks the symlink-resolved path against the mount root (`Sandbox+BashWorkspace.swift:57-74`). `SQLITE_OPEN_NOFOLLOW` adds a syscall-level backstop against a component swapped to a symlink *after* authorization. SQLite counts **every** symlinked component (`unixFullPathname` → `nSymlink`), so a naive `NOFOLLOW` open rejects legitimate system symlinks (macOS `/var → /private/var`); the open therefore **canonicalizes** the path first (`realpath`), and `NOFOLLOW` then fires only on a *post-canonicalization* swap. `authorize` resolves symlinks too, so both still target the **same real file** → no "authorize-one-path/open-another" gap.
+- `resolvePath` is **lexical and does not resolve symlinks** (`Shell+Path.swift:13-14, 57-66`) — that's fine: the **symlink-escape defense lives in `sandbox.authorize`**, which re-checks the symlink-resolved path against the mount root (`Sandbox+BashWorkspace.swift:57-74`). `SQLITE_OPEN_NOFOLLOW` adds a syscall-level backstop against a component swapped to a symlink *after* authorization: SQLite counts **every** symlinked component (`unixFullPathname` → `nSymlink`), so a clean fully-resolved path passes and only a later swap trips it. The engine therefore **canonicalizes once, before `authorize`**, and authorizes + opens that *same* `canonical` string — so they target the identical real file and `NOFOLLOW` guards it (canonicalizing *after* `authorize` would instead re-resolve and silently follow a post-authorization swap, defeating the flag). A naive `NOFOLLOW` on the lexical path would also wrongly reject macOS system symlinks (`/var → /private/var`), which canonicalizing avoids.
 - **Engine API** takes a host `URL` directly (per the "caller passes a sandboxed file URL" decision), so it never touches this resolution at all.
 
 **Supported configurations & fail-closed behavior:**
@@ -314,7 +315,7 @@ public extension Shell {
 ## 13. Open knobs
 
 1. **Journal mode** — WAL (best concurrency; `-wal`/`-shm` siblings) vs rollback (`-journal`; simplest). Both fine on native I/O.
-2. **M7 shim VFS** — ship now vs defer (recommended: defer; §5 confinement is closed/enumerable without it).
+2. **M7 shim VFS** — ship now vs defer (recommended: defer; §5 confinement is closed/enumerable without it). Partial symlink-race hardening is already in place: the **DB open** canonicalizes before `authorize` and opens with `SQLITE_OPEN_NOFOLLOW`, which is race-free (SQLite rejects the open if any component became a symlink after authorization). Two residual TOCTOU gaps are explicitly **M7-scope**: (a) the **audit-log append** uses leaf-only `O_NOFOLLOW`, so a *parent-directory* swapped to a symlink after authorization is still followed (needs `openat`-style walking from a trusted root fd); and (b) **WAL `-wal`/`-shm` sidecars** aren't separately authorized, so a Kit caller whose `authorize` grants a single file rather than its directory could see siblings created next to it.
 3. **`:memory:`** — the supported answer for in-memory/non-identity-mount callers that can't use a host file URL.
 4. **Value-level audit** — enable `SQLITE_ENABLE_PREUPDATE_HOOK` if old/new row values are needed (vs. table+rowid only).
 

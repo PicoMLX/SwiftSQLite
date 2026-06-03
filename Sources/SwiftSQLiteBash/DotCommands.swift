@@ -193,6 +193,33 @@ enum DotCommandRunner {
                     out += "INSERT INTO \(identifier) VALUES(\(values));\n"
                 }
             }
+            // Preserve AUTOINCREMENT counters: real sqlite3 dumps
+            // `sqlite_sequence` so a restore doesn't reuse rowids below the
+            // original high-water mark. It exists only once some table has used
+            // AUTOINCREMENT; scope it to `only` for a single-table dump so the
+            // restore doesn't clobber other tables' counters.
+            let hasSeq = try await connection.query(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' "
+                + "AND name='sqlite_sequence';")
+            if !hasSeq.rows.isEmpty {
+                var seqSQL = "SELECT name, seq FROM sqlite_sequence"
+                if let only {
+                    seqSQL += " WHERE name='\(escapeSQLString(only))'"
+                }
+                let seq = try await connection.query(seqSQL + ";")
+                if !seq.rows.isEmpty {
+                    if let only {
+                        out += "DELETE FROM sqlite_sequence WHERE name='"
+                            + "\(escapeSQLString(only))';\n"
+                    } else {
+                        out += "DELETE FROM sqlite_sequence;\n"
+                    }
+                    for row in seq.rows {
+                        let values = row.map(sqlLiteral).joined(separator: ",")
+                        out += "INSERT INTO sqlite_sequence VALUES(\(values));\n"
+                    }
+                }
+            }
             out += deferredSchema.joined()
             out += "COMMIT;\n"
             Shell.bashCurrent.stdout(out)
@@ -365,7 +392,16 @@ func sqlLiteral(_ value: SQLiteValue) -> String {
         if d.isFinite { return String(d) }
         if d.isNaN { return "NULL" }
         return d > 0 ? "9e999" : "-9e999"
-    case .text(let s): return "'\(escapeSQLString(s))'"
+    case .text(let s):
+        // An embedded NUL would truncate the dumped script when replayed
+        // (statements are prepared from a NUL-terminated C string). Render
+        // such text NUL-safely as a hex blob cast back to TEXT — an exact
+        // round-trip — instead of a raw quoted literal.
+        if s.utf8.contains(0) {
+            let hex = Data(s.utf8).map { String(format: "%02X", $0) }.joined()
+            return "CAST(x'\(hex)' AS TEXT)"
+        }
+        return "'\(escapeSQLString(s))'"
     case .blob(let data): return blobLiteral(data)
     }
 }
