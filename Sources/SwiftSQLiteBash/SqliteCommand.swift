@@ -217,7 +217,12 @@ public struct SqliteCommand: ParsableBashCommand {
         }
         do {
             try await shell.sandbox?.authorize(auditURL)
-            return FileAuditSink(url: auditURL)
+            let sink = FileAuditSink(url: auditURL)
+            // Preflight the open so an authorized-but-unusable path (directory,
+            // unwritable, leaf-symlink) fails closed here rather than running
+            // SQL unaudited and only erroring on the first post-commit flush.
+            try await sink.preflight()
+            return sink
         } catch {
             if isExplicit {
                 // Fail closed: don't run unaudited when a persistent trail was

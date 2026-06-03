@@ -98,4 +98,45 @@ struct ContractGuardTests {
             #expect(result.stderr.contains("overlap"), "stderr: \(result.stderr)")
         }
     }
+
+    /// Real disk reached *through* a mount but with NO sandbox gate: the guard
+    /// can't prove virtual==host, so a file database must fail closed (§4)
+    /// rather than open the wrong host path.
+    @Test func mountedFilesystemWithoutSandboxRefusesFileDatabase() async throws {
+        try await withTempDirectory { workspace in
+            let shell = Shell(
+                fileSystem: MountedFileSystem(
+                    mounts: [.init(virtual: workspace, host: workspace)],
+                    backing: RealFileSystem()),
+                environment: Environment(variables: [:], workingDirectory: workspace))
+            // shell.sandbox intentionally NOT set.
+            shell.installShellBuiltin(SqliteCommand.self)
+            let result = try await runCapturing(
+                shell, "sqlite3 -no-audit \(workspace)/t.db 'SELECT 1;'")
+            #expect(!result.status.isSuccess)
+        }
+    }
+
+    /// An explicit `-audit PATH` that is authorized but unusable as a log file
+    /// (here, an existing directory) must fail closed via the preflight open,
+    /// not run SQL unaudited and only error on the first post-commit flush.
+    @Test func explicitAuditPathThatIsUnusableFailsClosed() async throws {
+        try await withTempDirectory { workspace in
+            let shell = Shell(
+                fileSystem: MountedFileSystem(
+                    mounts: [.init(virtual: workspace, host: workspace)],
+                    backing: RealFileSystem()),
+                environment: Environment(variables: [:], workingDirectory: workspace))
+            shell.sandbox = Sandbox.bashWorkspace(workspace: workspace)
+            shell.installShellBuiltin(SqliteCommand.self)
+
+            let auditDir = "\(workspace)/auditdir"
+            try FileManager.default.createDirectory(
+                atPath: auditDir, withIntermediateDirectories: true)
+            let result = try await runCapturing(
+                shell, "sqlite3 -audit \(auditDir) \(workspace)/t.db 'CREATE TABLE t(x);'")
+            #expect(!result.status.isSuccess)
+            #expect(result.stderr.contains("audit"), "stderr: \(result.stderr)")
+        }
+    }
 }

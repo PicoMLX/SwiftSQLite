@@ -65,6 +65,23 @@ public actor FileAuditSink: AuditSink {
         self.url = url
     }
 
+    /// Verify the log can actually be created/opened for appending *before*
+    /// any SQL runs. An authorized-but-unusable path — a directory, an
+    /// unwritable location, or a leaf symlink that `O_NOFOLLOW` rejects —
+    /// otherwise yields a sink whose first `record` only fails to stderr after
+    /// statements may have committed. Throwing here lets an explicit `-audit`
+    /// request fail closed. Mirrors `record`'s open flags.
+    public func preflight() throws {
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true)
+        let fd = url.path.withCString {
+            open($0, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0o600)
+        }
+        guard fd >= 0 else { throw Self.errnoError() }
+        close(fd)
+    }
+
     public func record(_ events: [AuditEvent]) async {
         guard !events.isEmpty else { return }
         var blob = Data()

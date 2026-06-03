@@ -14,9 +14,35 @@ public enum SQLiteSQL {
     /// multi-line statement (e.g. a string literal containing `\n.tables\n`)
     /// is kept as data rather than misfired as a command.
     public static func isAtStatementBoundary(_ sql: String) -> Bool {
-        if sql.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return true
-        }
+        // A buffer of only whitespace and SQL comments has no pending
+        // statement — `sqlite3_complete` returns false for it (no terminating
+        // `;`), but the sqlite3 shell treats it as a boundary (its
+        // `_all_whitespace`), so a following dot-command is recognized rather
+        // than swallowed as SQL (e.g. `-- note\n.tables`).
+        if isAllWhitespaceOrComments(sql) { return true }
         return sqlite3_complete(sql) != 0
+    }
+
+    /// True if `sql` is only whitespace and complete/closed SQL comments
+    /// (`-- …` line and `/* … */` block), i.e. contains no statement tokens.
+    static func isAllWhitespaceOrComments(_ sql: String) -> Bool {
+        let s = Array(sql.unicodeScalars)
+        var i = 0
+        while i < s.count {
+            switch s[i] {
+            case " ", "\t", "\n", "\r", "\u{0B}", "\u{0C}":
+                i += 1
+            case "-" where i + 1 < s.count && s[i + 1] == "-":
+                i += 2
+                while i < s.count && s[i] != "\n" { i += 1 }
+            case "/" where i + 1 < s.count && s[i + 1] == "*":
+                i += 2
+                while i + 1 < s.count && !(s[i] == "*" && s[i + 1] == "/") { i += 1 }
+                i += 2   // skip the closing */ (or run past the end if unterminated)
+            default:
+                return false   // a real (non-comment) token
+            }
+        }
+        return true
     }
 }

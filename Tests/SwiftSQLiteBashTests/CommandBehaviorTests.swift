@@ -48,6 +48,17 @@ struct CommandBehaviorTests {
         #expect(result.stdout.contains("INSERT INTO \"a\"\"b\""), "dump: \(result.stdout)")
     }
 
+    /// A comment-only buffer before a dot-command must not swallow it: the
+    /// statement-boundary check treats whitespace + comments as no pending SQL
+    /// (e.g. `-- note\n.tables`), matching the sqlite3 shell.
+    @Test func dotCommandAfterCommentOnlyBufferRuns() async throws {
+        let shell = Shell()
+        shell.installShellBuiltin(SqliteCommand.self)
+        let result = try await runCapturing(
+            shell, "sqlite3 :memory:", stdin: "-- a comment\n.tables\n")
+        #expect(result.status.isSuccess, "stderr: \(result.stderr)")
+    }
+
     @Test func csvWithHeader() async throws {
         let shell = Shell()
         shell.installShellBuiltin(SqliteCommand.self)
