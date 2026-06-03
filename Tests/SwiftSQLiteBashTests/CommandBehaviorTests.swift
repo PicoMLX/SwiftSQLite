@@ -32,6 +32,22 @@ struct CommandBehaviorTests {
                 "stdout: \(result.stdout)")
     }
 
+    /// Dot-commands interpolate user table names into SQL. A name containing a
+    /// double-quote must be escaped (doubled) for the identifier context, or
+    /// `.dump`'s `SELECT * FROM "<name>"` becomes a syntax error / injection.
+    @Test func dumpEscapesQuotesInTableIdentifiers() async throws {
+        let shell = Shell()
+        shell.installShellBuiltin(SqliteCommand.self)
+        let script = """
+            CREATE TABLE "a""b" (x);
+            INSERT INTO "a""b" VALUES (1);
+            .dump
+            """
+        let result = try await runCapturing(shell, "sqlite3 :memory:", stdin: script)
+        #expect(result.status.isSuccess, "stderr: \(result.stderr)")
+        #expect(result.stdout.contains("INSERT INTO \"a\"\"b\""), "dump: \(result.stdout)")
+    }
+
     @Test func csvWithHeader() async throws {
         let shell = Shell()
         shell.installShellBuiltin(SqliteCommand.self)

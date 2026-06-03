@@ -18,3 +18,8 @@ func cleanupTempDB(_ url: URL) {
 }
 
 struct StubDenied: Error {}
+
+/// Carries the path the open gate was handed, so a test can assert the path
+/// was symlink-resolved *before* authorization (thrown rather than captured to
+/// stay `Sendable`-clean across the `@Sendable` authorize closure).
+struct AuthorizeSawPath: Error { let path: String }
