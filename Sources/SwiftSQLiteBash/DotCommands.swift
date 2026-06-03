@@ -66,13 +66,16 @@ enum DotCommandRunner {
                 let escaped = escapeSQLString(name)
                 filter += " AND (name='\(escaped)' OR tbl_name='\(escaped)')"
             }
-            // Union `sqlite_temp_schema` so `.schema` covers TEMP objects too
-            // (`type`/`name` are carried only to drive the ORDER BY of the
-            // union; emitSchemaSQL reads just the `sql` column).
-            let sql = "SELECT sql, type, name FROM sqlite_schema \(filter) "
+            // Union `sqlite_temp_schema` so `.schema` covers TEMP objects too.
+            // Wrap the compound query in a subquery before ORDER BY: a compound
+            // SELECT only allows ORDER BY on output columns, and `(type='table')`
+            // is an expression — ordering the outer (non-compound) SELECT is
+            // fine. emitSchemaSQL reads just the `sql` column.
+            let sql = "SELECT sql FROM ("
+                + "SELECT sql, type, name FROM sqlite_schema \(filter) "
                 + "UNION ALL "
-                + "SELECT sql, type, name FROM sqlite_temp_schema \(filter) "
-                + "ORDER BY (type='table') DESC, name;"
+                + "SELECT sql, type, name FROM sqlite_temp_schema \(filter)"
+                + ") ORDER BY (type='table') DESC, name;"
             return await emitSchemaSQL(connection, sql)
 
         case ".databases":
