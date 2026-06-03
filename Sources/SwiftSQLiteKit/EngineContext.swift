@@ -56,6 +56,16 @@ final class EngineContext: @unchecked Sendable {
         // reserved object. A deliberate limitation; the audit trail itself is
         // an external file, not an in-DB `_audit*` table.)
         if isReserved(object) { return SQLITE_DENY }
+        // CREATE INDEX/TRIGGER puts the NEW object's name in arg1 (the owning
+        // table is in arg2, already covered by `object`). Reject a reserved new
+        // name too — e.g. `CREATE INDEX _audit_i ON t` / `CREATE TRIGGER
+        // _audit_tr … ON t` — so the reserved namespace can't be populated.
+        if action == SQLITE_CREATE_INDEX || action == SQLITE_CREATE_TEMP_INDEX
+            || action == SQLITE_CREATE_TRIGGER
+            || action == SQLITE_CREATE_TEMP_TRIGGER,
+           isReserved(arg1) {
+            return SQLITE_DENY
+        }
 
         switch action {
         case SQLITE_ATTACH, SQLITE_DETACH:

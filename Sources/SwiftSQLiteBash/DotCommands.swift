@@ -58,15 +58,21 @@ enum DotCommandRunner {
             return await listSchema(connection, sql)
 
         case ".schema":
-            var sql = "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL "
+            var filter = "WHERE sql IS NOT NULL "
                 + "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
             if let name = args.first {
                 // Include the table's own indexes/triggers (tbl_name match),
                 // not just the object literally named NAME.
                 let escaped = escapeSQLString(name)
-                sql += " AND (name='\(escaped)' OR tbl_name='\(escaped)')"
+                filter += " AND (name='\(escaped)' OR tbl_name='\(escaped)')"
             }
-            sql += " ORDER BY (type='table') DESC, name;"
+            // Union `sqlite_temp_schema` so `.schema` covers TEMP objects too
+            // (`type`/`name` are carried only to drive the ORDER BY of the
+            // union; emitSchemaSQL reads just the `sql` column).
+            let sql = "SELECT sql, type, name FROM sqlite_schema \(filter) "
+                + "UNION ALL "
+                + "SELECT sql, type, name FROM sqlite_temp_schema \(filter) "
+                + "ORDER BY (type='table') DESC, name;"
             return await emitSchemaSQL(connection, sql)
 
         case ".databases":

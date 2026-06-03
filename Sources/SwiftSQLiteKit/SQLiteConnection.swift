@@ -66,16 +66,15 @@ public actor SQLiteConnection {
 
         // Distinguish opening an existing DB (.write) from creating a new one
         // (.create) so a caller's authorize closure can permit writes to an
-        // existing file while still denying new-file creation.
-        let intent: AccessIntent
-        if policy.readOnly {
-            intent = .read
-        } else {
-            intent = FileManager.default.fileExists(atPath: canonicalPath)
-                ? .write : .create
-        }
+        // existing file while still denying new-file creation. The SAME
+        // existence check drives open()'s CREATE flag, so a `.write` grant
+        // can't be bypassed by a file removed between here and the open.
+        let exists = FileManager.default.fileExists(atPath: canonicalPath)
+        let intent: AccessIntent = policy.readOnly
+            ? .read
+            : (exists ? .write : .create)
         try await authorize(URL(fileURLWithPath: canonicalPath), intent)
-        try handle.open()
+        try handle.open(allowCreate: !exists)
         try handle.configure()
     }
 
@@ -93,7 +92,7 @@ public actor SQLiteConnection {
             readOnly: policy.readOnly)
         self.ctx = ctx
         self.handle = ConnectionHandle(location: ":memory:", policy: policy, ctx: ctx)
-        try handle.open()
+        try handle.open(allowCreate: true)
         try handle.configure()
     }
 
@@ -197,13 +196,22 @@ private final class ConnectionHandle: @unchecked Sendable {
 
     // MARK: Open + harden
 
-    func open() throws {
+    func open(allowCreate: Bool) throws {
         var opened: OpaquePointer?
         // No SQLITE_OPEN_URI — file: URI tricks are off here and at compile
         // time (SQLITE_USE_URI=0).
-        var flags: Int32 = policy.readOnly
-            ? SQLITE_OPEN_READONLY
-            : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
+        var flags: Int32
+        if policy.readOnly {
+            flags = SQLITE_OPEN_READONLY
+        } else if allowCreate {
+            flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
+        } else {
+            // Existing-DB open authorized as `.write`: omit CREATE so the open
+            // FAILS rather than silently creating a new file if the database
+            // was removed after authorization — binding the `.write` grant to a
+            // non-creating open (a caller may permit .write but deny .create).
+            flags = SQLITE_OPEN_READWRITE
+        }
 
         // `location` was canonicalized BEFORE authorize (see
         // SQLiteConnection.init), so it is symlink-free and byte-identical to

@@ -319,6 +319,7 @@ public extension Shell {
 3. **`:memory:`** — the supported answer for in-memory/non-identity-mount callers that can't use a host file URL.
 4. **Value-level audit** — enable `SQLITE_ENABLE_PREUPDATE_HOOK` if old/new row values are needed (vs. table+rowid only). It is also the way to capture the remaining committed-DELETE case: the authorizer returns `SQLITE_IGNORE` for `SQLITE_DELETE` so `DELETE FROM t` is deleted row-by-row (defeating the truncate optimization) and thus seen by `sqlite3_update_hook`, but rows deleted via `ON CONFLICT REPLACE` are still not reported by the update hook — only the preupdate hook sees those.
 5. **Bounded stdin** — SQL piped on stdin is currently read fully into memory before `SQLITE_LIMIT_SQL_LENGTH` (a prepare-time cap) applies. An incremental, capped stdin read (rejecting input past `EnginePolicy.maxSQLLength` as it's consumed) is a follow-up for hardening against a large-pipe memory DoS.
+6. **`.dump` fidelity edges** — two known cases don't round-trip yet: (a) **non-UTF-8 TEXT** (SQLite doesn't enforce UTF-8; bytes from e.g. `CAST(x'80' AS TEXT)` are lossily decoded to U+FFFD at read time, so `.dump` can't recover them — preserving them needs the value model to carry raw bytes for TEXT); and (b) **generated columns** (`.dump` builds `INSERT … VALUES(…)` from `SELECT *`, which includes generated values that can't be inserted — it needs an explicit insertable-column list via `PRAGMA table_xinfo`). Both are advanced/edge cases; follow-ups.
 
 ## 14. References (SwiftBash files this design mirrors)
 

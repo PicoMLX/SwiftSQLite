@@ -91,4 +91,30 @@ struct CommandBehaviorTests {
         #expect(result.stdout.contains("perm"))
         #expect(result.stdout.contains("tmp"))
     }
+
+    @Test func dotSchemaIncludesTempObjects() async throws {
+        let shell = Shell()
+        shell.installShellBuiltin(SqliteCommand.self)
+        let script = """
+            CREATE TEMP TABLE tmp(y);
+            .schema tmp
+            """
+        let result = try await runCapturing(shell, "sqlite3 :memory:", stdin: script)
+        #expect(result.status.isSuccess, "stderr: \(result.stderr)")
+        #expect(result.stdout.contains("tmp"))
+    }
+
+    /// Creating an object in the reserved `_audit*` namespace must be denied
+    /// even when the owning table is allowed (the new index/trigger name is in
+    /// arg1, which the reserved-prefix guard now also checks).
+    @Test func reservedIndexNameIsDenied() async throws {
+        let shell = Shell()
+        shell.installShellBuiltin(SqliteCommand.self)
+        let result = try await runCapturing(
+            shell, "sqlite3 :memory:",
+            stdin: "CREATE TABLE t(x);\nCREATE INDEX _audit_i ON t(x);\n")
+        #expect(!result.status.isSuccess)
+        #expect(result.stderr.lowercased().contains("authoriz"),
+                "stderr: \(result.stderr)")
+    }
 }
