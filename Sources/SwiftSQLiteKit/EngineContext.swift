@@ -23,6 +23,10 @@ final class EngineContext: @unchecked Sendable {
     /// Per-row update-hook records awaiting a commit. Promoted to
     /// `committed` events on `commit()`, dropped on `rollback()`.
     private var pending: [(table: String, rowid: Int64, op: String)] = []
+    /// Open savepoints as `(name, pending.count when created)`. Lets a
+    /// `ROLLBACK TO s` discard the pending rows recorded after `s` (SQLite
+    /// fires no rollback hook for `ROLLBACK TO`).
+    private var savepoints: [(name: String, mark: Int)] = []
 
     var deadlineNanos: UInt64?
 
@@ -42,7 +46,39 @@ final class EngineContext: @unchecked Sendable {
             action: Self.actionName(action),
             table: guardedObjectName(action: action, arg1: arg1, arg2: arg2),
             allowed: decision != SQLITE_DENY))
+        // Track savepoint boundaries so `ROLLBACK TO s` drops the pending
+        // committed-audit rows recorded after `s`. arg1 is the operation
+        // ("BEGIN"/"RELEASE"/"ROLLBACK"), arg2 the savepoint name. The
+        // authorizer fires at prepare time and runScript prepares+steps one
+        // statement at a time, so when `ROLLBACK TO s` is prepared the
+        // intervening rows are already in `pending`.
+        if action == SQLITE_SAVEPOINT, decision == SQLITE_OK {
+            applySavepoint(operation: arg1, name: arg2)
+        }
         return decision
+    }
+
+    private func applySavepoint(operation: String?, name: String?) {
+        guard let name else { return }
+        switch operation {
+        case "BEGIN":
+            savepoints.append((name: name, mark: pending.count))
+        case "ROLLBACK":
+            // Discard pending rows recorded after `s`, and drop nested
+            // savepoints above it; `s` itself stays active.
+            guard let idx = savepoints.lastIndex(where: { $0.name == name })
+            else { return }
+            let mark = savepoints[idx].mark
+            if mark < pending.count { pending.removeLast(pending.count - mark) }
+            savepoints.removeSubrange((idx + 1)...)
+        case "RELEASE":
+            // `s` (and nested savepoints) merge into the parent; rows remain.
+            if let idx = savepoints.lastIndex(where: { $0.name == name }) {
+                savepoints.removeSubrange(idx...)
+            }
+        default:
+            break
+        }
     }
 
     private func decide(action: Int32, arg1: String?, arg2: String?) -> Int32 {
@@ -189,19 +225,20 @@ final class EngineContext: @unchecked Sendable {
             events.append(.committed(table: record.table, rowid: record.rowid, op: record.op))
         }
         pending.removeAll(keepingCapacity: true)
+        savepoints.removeAll(keepingCapacity: true)
     }
 
     /// Drop pending rows — the transaction rolled back, so they never
     /// committed. They remain in the *attempted* stream (recorded by the
     /// authorizer), never the committed stream.
     ///
-    /// Known limitation: this fires only on a full transaction rollback, not
-    /// on `ROLLBACK TO SAVEPOINT` (SQLite exposes no savepoint-execution
-    /// hook), and the pending buffer has no savepoint boundaries. So rows
-    /// written after a savepoint that is later rolled back to may still be
-    /// promoted to the committed stream. The attempted stream is unaffected.
+    /// `ROLLBACK TO SAVEPOINT` (which fires no rollback hook) is handled
+    /// separately via the savepoint markers in `applySavepoint` — a partial
+    /// rollback trims `pending` back to the savepoint boundary, so this full
+    /// rollback only has to clear what remains.
     func rollback() {
         pending.removeAll(keepingCapacity: true)
+        savepoints.removeAll(keepingCapacity: true)
     }
 
     // MARK: Timeout / cancellation
@@ -229,6 +266,7 @@ final class EngineContext: @unchecked Sendable {
 
     func discardPending() {
         pending.removeAll(keepingCapacity: false)
+        savepoints.removeAll(keepingCapacity: false)
     }
 
     // MARK: Action-code names (for the attempted stream)

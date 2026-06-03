@@ -95,4 +95,43 @@ struct AuditTests {
             return false
         }, "committed DELETE rows should be audited, got \(committed)")
     }
+
+    /// A row inserted inside a savepoint that is rolled back before COMMIT
+    /// never lands, so it must not appear in the committed stream (the
+    /// rollback hook doesn't fire for `ROLLBACK TO` — savepoint markers handle
+    /// it).
+    @Test func rolledBackSavepointInsertIsNotCommitted() async throws {
+        let sink = InMemoryAuditSink()
+        let db = try await SQLiteConnection(inMemory: .default, audit: sink)
+        try await db.execute("CREATE TABLE t(x);")
+        try await db.run(
+            "BEGIN; SAVEPOINT s; INSERT INTO t(x) VALUES (1); ROLLBACK TO s; COMMIT;")
+
+        let count = try await db.query("SELECT count(*) FROM t;")
+        #expect(count.rows[0][0] == .integer(0))
+        await db.close()
+
+        let committed = await sink.committed
+        #expect(!committed.contains {
+            if case .committed(_, _, "INSERT") = $0 { return true }
+            return false
+        }, "rolled-back savepoint insert leaked into committed: \(committed)")
+    }
+
+    /// Control: an insert in a savepoint that is RELEASEd (merged into the
+    /// outer transaction) and committed *does* appear in the committed stream.
+    @Test func releasedSavepointInsertIsCommitted() async throws {
+        let sink = InMemoryAuditSink()
+        let db = try await SQLiteConnection(inMemory: .default, audit: sink)
+        try await db.execute("CREATE TABLE t(x);")
+        try await db.run(
+            "BEGIN; SAVEPOINT s; INSERT INTO t(x) VALUES (1); RELEASE s; COMMIT;")
+        await db.close()
+
+        let committed = await sink.committed
+        #expect(committed.contains {
+            if case .committed(_, _, "INSERT") = $0 { return true }
+            return false
+        }, "released savepoint insert should be committed, got \(committed)")
+    }
 }
