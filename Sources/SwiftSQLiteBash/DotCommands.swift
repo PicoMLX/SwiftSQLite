@@ -53,7 +53,10 @@ enum DotCommandRunner {
             var sql = "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL "
                 + "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
             if let name = args.first {
-                sql += " AND name='\(escapeSQLString(name))'"
+                // Include the table's own indexes/triggers (tbl_name match),
+                // not just the object literally named NAME.
+                let escaped = escapeSQLString(name)
+                sql += " AND (name='\(escaped)' OR tbl_name='\(escaped)')"
             }
             sql += " ORDER BY (type='table') DESC, name;"
             return await emitSchemaSQL(connection, sql)
@@ -135,6 +138,12 @@ enum DotCommandRunner {
             // No `PRAGMA foreign_keys=OFF;` here: replaying the dump through
             // this sandboxed command would hit the all-PRAGMA-denied
             // authorizer. The whole restore runs in one transaction instead.
+            //
+            // Limitation: rows are emitted in table-name order, not foreign-key
+            // dependency order, and foreign_keys can't be toggled off in the
+            // sandbox — so restoring a dump of FK-constrained tables can fail
+            // when a child row precedes its parent. Adequate for inspection;
+            // a dependency-ordered dump is future work.
             var out = "BEGIN TRANSACTION;\n"
             var schemaSQL = "SELECT type, name, sql FROM sqlite_schema "
                 + "WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
@@ -331,7 +340,13 @@ func sqlLiteral(_ value: SQLiteValue) -> String {
     switch value {
     case .null: return "NULL"
     case .integer(let i): return String(i)
-    case .real(let d): return String(d)
+    case .real(let d):
+        // String(infinity) is "inf", which SQLite parses as an identifier,
+        // not a number — emit a restorable numeric literal instead. (SQLite
+        // normalizes NaN to NULL on storage, so NaN shouldn't occur.)
+        if d.isFinite { return String(d) }
+        if d.isNaN { return "NULL" }
+        return d > 0 ? "9e999" : "-9e999"
     case .text(let s): return "'\(escapeSQLString(s))'"
     case .blob(let data): return blobLiteral(data)
     }

@@ -110,6 +110,12 @@ final class EngineContext: @unchecked Sendable {
     private func guardedObjectName(action: Int32, arg1: String?, arg2: String?) -> String? {
         switch action {
         case SQLITE_ALTER_TABLE:
+            // arg2 is the table being altered (its OLD name on a RENAME).
+            // Limitation: SQLite doesn't pass the NEW name to the authorizer,
+            // so `ALTER TABLE t RENAME TO _audit_x` isn't caught by the
+            // reserved-prefix guard. Low severity — the audit trail is an
+            // external file, not an in-DB `_audit*` table, so the reserved
+            // namespace is defense-in-depth only.
             return arg2
         case SQLITE_CREATE_INDEX, SQLITE_CREATE_TEMP_INDEX,
              SQLITE_DROP_INDEX, SQLITE_DROP_TEMP_INDEX,
