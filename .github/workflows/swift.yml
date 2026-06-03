@@ -10,18 +10,23 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# scripts/fetch-sqlite.sh downloads the SQLite amalgamation and verifies it
-# against the SHA3-256 pinned in Sources/CSQLite/VERSION (fail-closed on a
-# mismatch). Both jobs therefore need network access to sqlite.org.
+# macOS-only, mirroring the sibling SwiftGog repo's proven CI. A full
+# SwiftBash consumer builds cleanly on macOS (Xcode 26 / Swift 6.2); the Linux
+# build of BashCommandKit's SwiftPorts closure (libgit2 + the compression
+# family + ripgrep) needs heavier system-lib setup. SwiftSQLiteKit itself is
+# SwiftBash-agnostic and Linux-clean, so a Linux engine-only job can be added
+# later without that closure.
 #
-# Building SwiftSQLiteBash pulls in SwiftBash's BashCommandKit, which links
-# the SwiftPorts CLI surface (libgit2 + the bzip2/xz/zstd/lz4 family), so
-# both jobs install those system C deps — mirroring SwiftBash's own CI.
+# Package.resolved pins marcprux/swift-archive by revision — its `master`
+# branch was renamed, so a fresh resolve would otherwise fail chasing the dead
+# ref. scripts/fetch-sqlite.sh then downloads + SHA3-256-verifies the SQLite
+# amalgamation (fail-closed on mismatch); the runner needs network access to
+# sqlite.org.
 
 jobs:
   build-macos:
     runs-on: macos-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       # SwiftBash's manifest declares swift-tools-version 6.2, so the
@@ -30,6 +35,8 @@ jobs:
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: "26.0"
+      # bzip2 / zstd back SwiftPorts' compression kits; macOS runners usually
+      # already have them, so this is a defensive idempotent install.
       - name: Install C dependencies (Homebrew)
         run: |
           for pkg in bzip2 zstd; do
@@ -39,30 +46,7 @@ jobs:
         run: swift --version
       - name: Fetch SQLite amalgamation
         run: ./scripts/fetch-sqlite.sh
-      - name: Build (macOS)
+      - name: Build (including tests)
         run: swift build --build-tests -v
-      - name: Test (macOS)
-        run: swift test -v --skip-build --no-parallel
-
-  build-linux:
-    runs-on: ubuntu-latest
-    # Pinned >= 6.2 to satisfy SwiftBash's tools-version. Adjust the tag if
-    # your toolchain target differs.
-    container: swift:6.2-noble
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install C dependencies (apt)
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            curl unzip ca-certificates openssl pkg-config \
-            libssl-dev zlib1g-dev libbz2-dev liblzma-dev libzstd-dev liblz4-dev
-      - name: Verify Swift version
-        run: swift --version
-      - name: Fetch SQLite amalgamation
-        run: ./scripts/fetch-sqlite.sh
-      - name: Build (Linux)
-        run: swift build --build-tests -v
-      - name: Test (Linux)
-        run: swift test -v --skip-build --no-parallel
+      - name: Test
+        run: swift test --skip-build

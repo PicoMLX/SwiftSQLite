@@ -1,0 +1,14 @@
+{
+  "pins" : [
+    {
+      "identity" : "swift-archive",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/marcprux/swift-archive",
+      "state" : {
+        "branch" : "master",
+        "revision" : "60f478d10ae730c4faed643d3fcc746c07a7e7e5"
+      }
+    }
+  ],
+  "version" : 2
+}
