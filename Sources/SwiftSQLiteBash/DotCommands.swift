@@ -35,10 +35,18 @@ enum DotCommandRunner {
 
         switch command {
         case ".tables":
+            // Union in `sqlite_temp_schema` so TEMP tables/views (which the
+            // authorizer allows) show up too, matching the real sqlite3 shell.
             return await listSchema(
                 connection,
-                "SELECT name FROM sqlite_schema WHERE type IN ('table','view') "
-                    + "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name;")
+                "SELECT name FROM sqlite_schema "
+                    + "WHERE type IN ('table','view') "
+                    + "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
+                    + "UNION "
+                    + "SELECT name FROM sqlite_temp_schema "
+                    + "WHERE type IN ('table','view') "
+                    + "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
+                    + "ORDER BY name;")
 
         case ".indexes", ".indices":
             var sql = "SELECT name FROM sqlite_schema WHERE type='index' "

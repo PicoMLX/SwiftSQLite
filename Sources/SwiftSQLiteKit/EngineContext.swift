@@ -41,7 +41,7 @@ final class EngineContext: @unchecked Sendable {
         events.append(.attempted(
             action: Self.actionName(action),
             table: guardedObjectName(action: action, arg1: arg1, arg2: arg2),
-            allowed: decision == SQLITE_OK))
+            allowed: decision != SQLITE_DENY))
         return decision
     }
 
@@ -78,7 +78,26 @@ final class EngineContext: @unchecked Sendable {
             // them. (`_audit*` was already denied above.)
             return SQLITE_OK
 
-        case SQLITE_INSERT, SQLITE_UPDATE, SQLITE_DELETE,
+        case SQLITE_DELETE:
+            if readOnly { return SQLITE_DENY }
+            // DDL is reported as a DELETE on `sqlite_master` (see the schema
+            // note below) and other internal bookkeeping touches `sqlite_*`
+            // tables — leave all those as OK, unperturbed. For a real
+            // *user-table* delete, return IGNORE so SQLite disables the
+            // truncate optimization and deletes rows individually. Otherwise
+            // `DELETE FROM t` (no WHERE) skips sqlite3_update_hook and the
+            // committed-audit stream would miss those rows (sqlite3.h: the
+            // update hook is "not invoked when rows are deleted using the
+            // truncate optimization"). For SQLITE_DELETE, IGNORE means
+            // "proceed, but row-by-row" (sqlite3.h authorizer docs) — it does
+            // NOT skip the delete. (ON CONFLICT REPLACE deletes are still
+            // missed; capturing those needs the preupdate hook — open-knob #4.)
+            if (object ?? "").lowercased().hasPrefix("sqlite_") {
+                return SQLITE_OK
+            }
+            return SQLITE_IGNORE
+
+        case SQLITE_INSERT, SQLITE_UPDATE,
              SQLITE_CREATE_TABLE, SQLITE_CREATE_TEMP_TABLE,
              SQLITE_CREATE_INDEX, SQLITE_CREATE_TEMP_INDEX,
              SQLITE_CREATE_VIEW, SQLITE_CREATE_TEMP_VIEW,

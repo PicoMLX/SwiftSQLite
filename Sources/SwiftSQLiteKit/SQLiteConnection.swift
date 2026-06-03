@@ -64,7 +64,16 @@ public actor SQLiteConnection {
         let canonicalPath = ConnectionHandle.canonicalize(url.path)
         self.handle = ConnectionHandle(location: canonicalPath, policy: policy, ctx: ctx)
 
-        let intent: AccessIntent = policy.readOnly ? .read : .create
+        // Distinguish opening an existing DB (.write) from creating a new one
+        // (.create) so a caller's authorize closure can permit writes to an
+        // existing file while still denying new-file creation.
+        let intent: AccessIntent
+        if policy.readOnly {
+            intent = .read
+        } else {
+            intent = FileManager.default.fileExists(atPath: canonicalPath)
+                ? .write : .create
+        }
         try await authorize(URL(fileURLWithPath: canonicalPath), intent)
         try handle.open()
         try handle.configure()
@@ -109,7 +118,11 @@ public actor SQLiteConnection {
         let handle = self.handle
         do {
             let result = try await withTaskCancellationHandler {
-                try handle.runScript(sql)
+                // A task cancelled *before* the first sqlite3_step would
+                // otherwise run to completion: onCancel's interrupt() is a
+                // no-op when no statement is in flight. Refuse to start.
+                try Task.checkCancellation()
+                return try handle.runScript(sql)
             } onCancel: {
                 // sqlite3_interrupt is thread-safe (SQLITE_THREADSAFE=1) and
                 // makes the in-flight step return SQLITE_INTERRUPT. No shared

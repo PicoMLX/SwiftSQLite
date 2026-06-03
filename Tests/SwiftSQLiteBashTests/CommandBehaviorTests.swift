@@ -77,4 +77,18 @@ struct CommandBehaviorTests {
         #expect(result.status.isSuccess)
         #expect(result.stdout.contains("42"))
     }
+
+    @Test func dotTablesIncludesTempTables() async throws {
+        let shell = Shell()
+        shell.installShellBuiltin(SqliteCommand.self)
+        let script = """
+            CREATE TABLE perm(x);
+            CREATE TEMP TABLE tmp(y);
+            .tables
+            """
+        let result = try await runCapturing(shell, "sqlite3 :memory:", stdin: script)
+        #expect(result.status.isSuccess, "stderr: \(result.stderr)")
+        #expect(result.stdout.contains("perm"))
+        #expect(result.stdout.contains("tmp"))
+    }
 }

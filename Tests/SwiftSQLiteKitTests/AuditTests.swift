@@ -77,4 +77,22 @@ struct AuditTests {
         #expect(text.contains("\"action\":\"INSERT\""))
         #expect(text.contains("\"action\":\"DROP_TABLE\""))
     }
+
+    /// `DELETE FROM t` (no WHERE) is a truncate-optimization candidate that
+    /// would skip `sqlite3_update_hook`; the authorizer returns IGNORE for
+    /// DELETE so rows are removed individually and the committed stream still
+    /// records them.
+    @Test func committedDeleteAppearsInCommittedStream() async throws {
+        let sink = InMemoryAuditSink()
+        let db = try await SQLiteConnection(inMemory: .default, audit: sink)
+        try await db.execute("CREATE TABLE t(x); INSERT INTO t(x) VALUES (1),(2),(3);")
+        try await db.execute("DELETE FROM t;")
+        await db.close()
+
+        let committed = await sink.committed
+        #expect(committed.contains {
+            if case .committed(_, _, "DELETE") = $0 { return true }
+            return false
+        }, "committed DELETE rows should be audited, got \(committed)")
+    }
 }
