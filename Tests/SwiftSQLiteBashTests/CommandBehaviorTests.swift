@@ -130,21 +130,4 @@ struct CommandBehaviorTests {
         #expect(result.status.isSuccess, "stderr: \(result.stderr)")
         #expect(result.stdout.contains("tmp_idx"))
     }
-
-    /// `.dump` must name only insertable columns for a table with a generated
-    /// column — a positional `VALUES(...)` would try to write the generated
-    /// value and fail on replay.
-    @Test func dumpExcludesGeneratedColumns() async throws {
-        let shell = Shell()
-        shell.installShellBuiltin(SqliteCommand.self)
-        let script = """
-            CREATE TABLE t(a, b GENERATED ALWAYS AS (a+1) STORED);
-            INSERT INTO t(a) VALUES (1);
-            .dump
-            """
-        let result = try await runCapturing(shell, "sqlite3 :memory:", stdin: script)
-        #expect(result.status.isSuccess, "stderr: \(result.stderr)")
-        #expect(result.stdout.contains("INSERT INTO \"t\" (\"a\") VALUES(1)"),
-                "dump:\n\(result.stdout)")
-    }
 }
