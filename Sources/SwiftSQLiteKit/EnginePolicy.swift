@@ -28,6 +28,11 @@ public struct EnginePolicy: Sendable {
     /// statement text.
     public var maxSQLLength: Int = 1_000_000
 
+    /// `SQLITE_LIMIT_LENGTH` ceiling — the maximum size (bytes) of any single
+    /// string/blob value. Bounds the memory a single result cell can use when
+    /// copied out (e.g. `SELECT zeroblob(...)`). Default 50 MB.
+    public var maxValueBytes: Int = 50_000_000
+
     public init() {}
 
     public static let `default` = EnginePolicy()

@@ -84,8 +84,12 @@ final class EngineContext: @unchecked Sendable {
              SQLITE_DROP_TRIGGER, SQLITE_DROP_TEMP_TRIGGER,
              SQLITE_ALTER_TABLE:
             if readOnly { return SQLITE_DENY }
-            // Never let user SQL write the schema-table family directly.
-            if isProtectedSQLite(object) { return SQLITE_DENY }
+            // `sqlite_schema` writes are deliberately NOT denied here:
+            // legitimate DDL (CREATE/DROP/ALTER) is reported to the
+            // authorizer as an INSERT/DELETE on `sqlite_master`, so denying
+            // it would reject all DDL. Direct user writes to the schema
+            // table are instead blocked by SQLITE_DBCONFIG_DEFENSIVE
+            // (enabled in configure()).
             return SQLITE_OK
 
         default:
@@ -111,11 +115,6 @@ final class EngineContext: @unchecked Sendable {
         default:
             return arg1
         }
-    }
-
-    private func isProtectedSQLite(_ name: String?) -> Bool {
-        guard let name else { return false }
-        return name.lowercased().hasPrefix("sqlite_")
     }
 
     private func isReserved(_ name: String?) -> Bool {

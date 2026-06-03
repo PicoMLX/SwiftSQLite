@@ -31,14 +31,20 @@ public actor SQLiteConnection {
         audit: any AuditSink,
         authorize: @Sendable (URL, AccessIntent) async throws -> Void
     ) async throws {
+        // Require a host file URL: anything else (e.g. `foo:bar`) would be
+        // authorized as one string but handed to sqlite3_open_v2 as a
+        // different filename. Use the in-memory initializer for ':memory:'.
+        guard url.isFileURL else {
+            throw SQLiteEngineError.unsupported(
+                "SQLiteConnection(url:) requires a file URL")
+        }
         self.policy = policy
         self.audit = audit
         let ctx = EngineContext(
             reservedTablePrefix: policy.reservedTablePrefix,
             readOnly: policy.readOnly)
         self.ctx = ctx
-        let location = url.isFileURL ? url.path : url.absoluteString
-        self.handle = ConnectionHandle(location: location, policy: policy, ctx: ctx)
+        self.handle = ConnectionHandle(location: url.path, policy: policy, ctx: ctx)
 
         let intent: AccessIntent = policy.readOnly ? .read : .create
         try await authorize(url, intent)
@@ -161,12 +167,16 @@ private final class ConnectionHandle: @unchecked Sendable {
 
     func open() throws {
         var opened: OpaquePointer?
-        var flags: Int32 = policy.readOnly
+        // No SQLITE_OPEN_URI — file: URI tricks are off here and at compile
+        // time (SQLITE_USE_URI=0). SQLITE_OPEN_NOFOLLOW is intentionally NOT
+        // set: it rejects any path containing a symlinked component, which
+        // breaks legitimate opens on macOS (temp/app dirs live under
+        // /var → /private/var). The symlink-escape defense is the caller's
+        // sandbox.authorize, which re-checks the symlink-resolved path against
+        // the workspace root (§4 / §5 step 1).
+        let flags: Int32 = policy.readOnly
             ? SQLITE_OPEN_READONLY
             : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
-        // Syscall-level symlink backstop (§4). No SQLITE_OPEN_URI — file:
-        // URI tricks are off here and at compile time (SQLITE_USE_URI=0).
-        flags |= SQLITE_OPEN_NOFOLLOW
 
         let rc = sqlite3_open_v2(location, &opened, flags, nil)
         if rc != SQLITE_OK {
@@ -193,6 +203,10 @@ private final class ConnectionHandle: @unchecked Sendable {
 
         sqlite3_limit(db, SQLITE_LIMIT_ATTACHED, 0)
         sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, Int32(clamping: policy.maxSQLLength))
+        // Cap the size of any single string/blob result so an untrusted
+        // query like `SELECT zeroblob(500000000)` can't exhaust memory when
+        // its value is copied out in columnValue (DoS guard).
+        sqlite3_limit(db, SQLITE_LIMIT_LENGTH, Int32(clamping: policy.maxValueBytes))
         sqlite3_busy_timeout(db, policy.busyTimeout.millisecondsInt32)
 
         try execInternal("PRAGMA foreign_keys=ON;")
