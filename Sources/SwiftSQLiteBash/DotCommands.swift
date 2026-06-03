@@ -49,12 +49,16 @@ enum DotCommandRunner {
                     + "ORDER BY name;")
 
         case ".indexes", ".indices":
-            var sql = "SELECT name FROM sqlite_schema WHERE type='index' "
+            var pred = "WHERE type='index' "
                 + "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
             if let table = args.first {
-                sql += " AND tbl_name='\(escapeSQLString(table))'"
+                pred += " AND tbl_name='\(escapeSQLString(table))'"
             }
-            sql += " ORDER BY name;"
+            // Union `sqlite_temp_schema` so indexes on TEMP tables list too
+            // (`name` is a plain output column, so a compound ORDER BY is fine).
+            let sql = "SELECT name FROM sqlite_schema \(pred) "
+                + "UNION SELECT name FROM sqlite_temp_schema \(pred) "
+                + "ORDER BY name;"
             return await listSchema(connection, sql)
 
         case ".schema":
@@ -191,7 +195,38 @@ enum DotCommandRunner {
                 }
             }
             for table in tableNames {
-                let rows = try await connection.query("SELECT * FROM \"\(escapeIdentifier(table))\";")
+                let identifier = "\"\(escapeIdentifier(table))\""
+                // Exclude generated columns: they can't be written, so a
+                // positional `VALUES(...)` from `SELECT *` fails on replay.
+                // `pragma_table_xinfo` reads as SQLITE_READ (allowed), unlike a
+                // PRAGMA statement (denied); fall back to `SELECT *` if the
+                // introspection isn't available so a normal dump still works.
+                let xinfo = try? await connection.query(
+                    "SELECT name, hidden FROM "
+                    + "pragma_table_xinfo('\(escapeSQLString(table))');")
+                let insertable = xinfo?.rows.compactMap { row -> String? in
+                    guard case let .text(col)? = row.first,
+                          case let .integer(hidden)? = row.dropFirst().first
+                    else { return nil }
+                    return (hidden == 2 || hidden == 3) ? nil : col  // skip generated
+                } ?? []
+                let hasGenerated = !insertable.isEmpty
+                    && insertable.count < (xinfo?.rows.count ?? 0)
+
+                let selectList: String
+                let columnList: String
+                if hasGenerated {
+                    let quoted = insertable
+                        .map { "\"\(escapeIdentifier($0))\"" }.joined(separator: ",")
+                    selectList = quoted
+                    columnList = " (\(quoted))"
+                } else {
+                    selectList = "*"
+                    columnList = ""
+                }
+
+                let rows = try await connection.query(
+                    "SELECT \(selectList) FROM \(identifier);")
                 if rows.truncated {
                     // The per-query row cap (EnginePolicy.rowLimit) is a safety
                     // guard, but for an export it would silently drop rows
@@ -204,10 +239,9 @@ enum DotCommandRunner {
                         + "export cap; .dump aborted to avoid silently producing "
                         + "an incomplete dump")
                 }
-                let identifier = "\"\(escapeIdentifier(table))\""
                 for row in rows.rows {
                     let values = row.map(sqlLiteral).joined(separator: ",")
-                    out += "INSERT INTO \(identifier) VALUES(\(values));\n"
+                    out += "INSERT INTO \(identifier)\(columnList) VALUES(\(values));\n"
                 }
             }
             // Preserve AUTOINCREMENT counters: real sqlite3 dumps

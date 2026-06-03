@@ -109,9 +109,18 @@ public actor SQLiteConnection {
     public func run(_ sql: String) async throws -> RunResult {
         try ensureOpen()
         let timeoutNanos = policy.statementTimeout.nanoseconds
-        ctx.beginScript(deadlineNanos: timeoutNanos == 0
-            ? nil
-            : DispatchTime.now().uptimeNanoseconds &+ timeoutNanos)
+        let deadlineNanos: UInt64?
+        if timeoutNanos == 0 {
+            deadlineNanos = nil
+        } else {
+            // Saturate rather than wrap (`&+`): a near-`UInt64.max` timeout
+            // would otherwise roll the deadline into the past and interrupt
+            // every statement immediately. `.max` reads as "no deadline".
+            let (sum, overflow) = DispatchTime.now().uptimeNanoseconds
+                .addingReportingOverflow(timeoutNanos)
+            deadlineNanos = overflow ? .max : sum
+        }
+        ctx.beginScript(deadlineNanos: deadlineNanos)
 
         // Capture a Sendable reference for the cancellation handler.
         let handle = self.handle
