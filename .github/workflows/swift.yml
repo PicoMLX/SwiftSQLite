@@ -1,0 +1,75 @@
+name: Swift
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# NOTE ON THE SQLITE PIN
+# scripts/fetch-sqlite.sh refuses to download until the official SHA3-256
+# is pinned in Sources/CSQLite/VERSION (fail-closed). To let CI run before
+# that one-time pin, the fetch steps below export SQLITE_ALLOW_UNPINNED=1.
+# Once you paste the real hash into VERSION, verification activates
+# automatically and the override becomes a no-op — you can drop it then.
+#
+# Building SwiftSQLiteBash pulls in SwiftBash's BashCommandKit, which links
+# the SwiftPorts CLI surface (libgit2 + the bzip2/xz/zstd/lz4 family), so
+# both jobs install those system C deps — mirroring SwiftBash's own CI.
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      # SwiftBash's manifest declares swift-tools-version 6.2, so the
+      # toolchain must be >= 6.2. Xcode 26.0 ships Swift 6.2.
+      - name: Select Xcode 26.0
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.0"
+      - name: Install C dependencies (Homebrew)
+        run: |
+          for pkg in bzip2 zstd; do
+            brew list --versions "$pkg" >/dev/null 2>&1 || brew install "$pkg"
+          done
+      - name: Verify Swift version
+        run: swift --version
+      - name: Fetch SQLite amalgamation
+        env:
+          SQLITE_ALLOW_UNPINNED: "1"   # see "NOTE ON THE SQLITE PIN" above
+        run: ./scripts/fetch-sqlite.sh
+      - name: Build (macOS)
+        run: swift build --build-tests -v
+      - name: Test (macOS)
+        run: swift test -v --skip-build --no-parallel
+
+  build-linux:
+    runs-on: ubuntu-latest
+    # Pinned >= 6.2 to satisfy SwiftBash's tools-version. Adjust the tag if
+    # your toolchain target differs.
+    container: swift:6.2-noble
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install C dependencies (apt)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            curl unzip ca-certificates openssl pkg-config \
+            libssl-dev zlib1g-dev libbz2-dev liblzma-dev libzstd-dev liblz4-dev
+      - name: Verify Swift version
+        run: swift --version
+      - name: Fetch SQLite amalgamation
+        env:
+          SQLITE_ALLOW_UNPINNED: "1"   # see "NOTE ON THE SQLITE PIN" above
+        run: ./scripts/fetch-sqlite.sh
+      - name: Build (Linux)
+        run: swift build --build-tests -v
+      - name: Test (Linux)
+        run: swift test -v --skip-build --no-parallel

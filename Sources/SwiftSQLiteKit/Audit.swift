@@ -75,22 +75,22 @@ public actor FileAuditSink: AuditSink {
 extension AuditEvent {
     /// Compact, single-line JSON encoding (used by `FileAuditSink`).
     var jsonLine: String {
-        let object: [String: Any]
+        var object: [String: Any] = [:]
         switch self {
         case let .attempted(action, table, allowed):
-            object = [
-                "kind": "attempted",
-                "action": action,
-                "table": table ?? NSNull(),
-                "allowed": allowed,
-            ]
+            object["kind"] = "attempted"
+            object["action"] = action
+            object["allowed"] = allowed
+            if let table {
+                object["table"] = table
+            } else {
+                object["table"] = NSNull()
+            }
         case let .committed(table, rowid, op):
-            object = [
-                "kind": "committed",
-                "table": table,
-                "rowid": rowid,
-                "op": op,
-            ]
+            object["kind"] = "committed"
+            object["table"] = table
+            object["rowid"] = rowid
+            object["op"] = op
         }
         guard
             let data = try? JSONSerialization.data(
