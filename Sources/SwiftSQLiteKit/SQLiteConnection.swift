@@ -8,14 +8,17 @@ import Foundation
 /// The engine is **SwiftBash-agnostic**: it takes a host `URL` plus an
 /// `authorize` closure (the SwiftBash seam, or a stub in tests) and never
 /// resolves paths itself.
+///
+/// The raw `sqlite3` handle and all synchronous C interaction live in a
+/// `ConnectionHandle` (a Sendable class), not in the actor's stored state, so
+/// the non-Sendable pointer never has to cross an actor-isolation boundary.
+/// The actor serializes every call into the handle, so there is no real
+/// concurrency on it.
 public actor SQLiteConnection {
-    private var db: OpaquePointer?
+    private let handle: ConnectionHandle
     private let policy: EnginePolicy
     private let audit: any AuditSink
     private let ctx: EngineContext
-    /// The exact string passed to `sqlite3_open_v2` — for a file URL this
-    /// is `url.path`, i.e. the same string the caller authorized (§4).
-    private let location: String
     private var isClosed = false
 
     /// A connection to the file at `url` (a HOST file URL — the caller is
@@ -30,15 +33,17 @@ public actor SQLiteConnection {
     ) async throws {
         self.policy = policy
         self.audit = audit
-        self.ctx = EngineContext(
+        let ctx = EngineContext(
             reservedTablePrefix: policy.reservedTablePrefix,
             readOnly: policy.readOnly)
-        self.location = url.isFileURL ? url.path : url.absoluteString
+        self.ctx = ctx
+        let location = url.isFileURL ? url.path : url.absoluteString
+        self.handle = ConnectionHandle(location: location, policy: policy, ctx: ctx)
 
         let intent: AccessIntent = policy.readOnly ? .read : .create
         try await authorize(url, intent)
-        try openDatabase()
-        try configure()
+        try handle.open()
+        try handle.configure()
     }
 
     /// An in-memory database (PLAN.md open-knob #3) — the supported answer
@@ -50,72 +55,18 @@ public actor SQLiteConnection {
     ) async throws {
         self.policy = policy
         self.audit = audit
-        self.ctx = EngineContext(
+        let ctx = EngineContext(
             reservedTablePrefix: policy.reservedTablePrefix,
             readOnly: policy.readOnly)
-        self.location = ":memory:"
-        try openDatabase()
-        try configure()
+        self.ctx = ctx
+        self.handle = ConnectionHandle(location: ":memory:", policy: policy, ctx: ctx)
+        try handle.open()
+        try handle.configure()
     }
 
-    deinit {
-        // Safety net if `close()` was never called. No audit flush is
-        // possible here (deinit is synchronous); callers should `close()`.
-        if let db, !isClosed { sqlite3_close_v2(db) }
-    }
-
-    // MARK: Open + harden
-
-    private func openDatabase() throws {
-        var handle: OpaquePointer?
-        var flags: Int32 = policy.readOnly
-            ? SQLITE_OPEN_READONLY
-            : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
-        // Syscall-level symlink backstop (§4). No SQLITE_OPEN_URI — file:
-        // URI tricks are off here and at compile time (SQLITE_USE_URI=0).
-        flags |= SQLITE_OPEN_NOFOLLOW
-
-        let rc = sqlite3_open_v2(location, &handle, flags, nil)
-        if rc != SQLITE_OK {
-            let message = handle.map { String(cString: sqlite3_errmsg($0)) }
-                ?? "unable to open database"
-            if let handle { sqlite3_close_v2(handle) }
-            throw SQLiteError(code: rc, message: message)
-        }
-        guard let handle else {
-            throw SQLiteError(code: rc, message: "open returned no handle")
-        }
-        self.db = handle
-    }
-
-    /// Runtime hardening + the pragmas we need, then install the
-    /// authorizer and hooks (PLAN.md §7). Order matters: pragmas are
-    /// issued *before* the authorizer (which denies all user PRAGMA).
-    private func configure() throws {
-        guard let db else { throw SQLiteEngineError.notOpen }
-
-        _ = csqlite_db_config_onoff(db, SQLITE_DBCONFIG_DEFENSIVE, 1)
-        _ = csqlite_db_config_onoff(db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0)
-        _ = csqlite_db_config_onoff(db, SQLITE_DBCONFIG_TRUSTED_SCHEMA, 0)
-
-        sqlite3_limit(db, SQLITE_LIMIT_ATTACHED, 0)
-        sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, Int32(clamping: policy.maxSQLLength))
-        sqlite3_busy_timeout(db, policy.busyTimeout.millisecondsInt32)
-
-        try execInternal("PRAGMA foreign_keys=ON;")
-        try execInternal("PRAGMA temp_store=MEMORY;")   // pin temp spill (§5 step 2)
-        if location != ":memory:" && !policy.readOnly {
-            // WAL keeps -wal/-shm as in-dir siblings; best-effort.
-            _ = try? execInternal("PRAGMA journal_mode=WAL;")
-        }
-
-        let appData = Unmanaged.passUnretained(ctx).toOpaque()
-        sqlite3_set_authorizer(db, csqliteAuthorizerCallback, appData)
-        sqlite3_progress_handler(db, 10_000, csqliteProgressCallback, appData)
-        _ = sqlite3_commit_hook(db, csqliteCommitCallback, appData)
-        _ = sqlite3_update_hook(db, csqliteUpdateCallback, appData)
-        _ = sqlite3_rollback_hook(db, csqliteRollbackCallback, appData)
-    }
+    // No actor `deinit` — `ConnectionHandle.deinit` closes the database as a
+    // safety net. (An actor deinit can't touch the non-Sendable handle, and
+    // can't flush the audit asynchronously anyway; callers should `close()`.)
 
     // MARK: Public API
 
@@ -130,12 +81,15 @@ public actor SQLiteConnection {
             ? nil
             : DispatchTime.now().uptimeNanoseconds &+ timeoutNanos)
 
-        let box = InterruptBox(db: db, ctx: ctx)
+        // Capture Sendable references for the cancellation handler.
+        let handle = self.handle
+        let ctx = self.ctx
         do {
             let result = try await withTaskCancellationHandler {
-                try self.runScript(sql)
+                try handle.runScript(sql)
             } onCancel: {
-                box.interrupt()
+                ctx.cancelled = true   // best-effort; sqlite3_interrupt is authoritative
+                handle.interrupt()
             }
             await flushAudit()
             return result
@@ -163,16 +117,102 @@ public actor SQLiteConnection {
         isClosed = true
         await flushAudit()
         ctx.discardPending()
-        if let db {
-            sqlite3_set_authorizer(db, nil, nil)
-            sqlite3_close_v2(db)
+        handle.close()
+    }
+
+    // MARK: Helpers
+
+    private func flushAudit() async {
+        let events = ctx.drainEvents()
+        guard !events.isEmpty else { return }
+        await audit.record(events)
+    }
+
+    private func ensureOpen() throws {
+        if isClosed || !handle.isOpen { throw SQLiteEngineError.notOpen }
+    }
+}
+
+/// Owns the raw `sqlite3` handle and every synchronous C call. A plain
+/// (`@unchecked Sendable`) class rather than actor state, so the non-Sendable
+/// `OpaquePointer` never trips Swift 6 actor-isolation / data-race checks. The
+/// owning `SQLiteConnection` actor serializes all access, and the C callbacks
+/// fire synchronously on that same executor thread — so the access is
+/// single-threaded in practice. `cancelled` may be set from another thread by
+/// the cancellation handler (a benign flag; `sqlite3_interrupt` is the real
+/// mechanism, and is thread-safe with `SQLITE_THREADSAFE=1`).
+private final class ConnectionHandle: @unchecked Sendable {
+    private var db: OpaquePointer?
+    private let location: String
+    private let policy: EnginePolicy
+    private let ctx: EngineContext
+
+    init(location: String, policy: EnginePolicy, ctx: EngineContext) {
+        self.location = location
+        self.policy = policy
+        self.ctx = ctx
+    }
+
+    deinit { close() }
+
+    var isOpen: Bool { db != nil }
+
+    // MARK: Open + harden
+
+    func open() throws {
+        var opened: OpaquePointer?
+        var flags: Int32 = policy.readOnly
+            ? SQLITE_OPEN_READONLY
+            : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
+        // Syscall-level symlink backstop (§4). No SQLITE_OPEN_URI — file:
+        // URI tricks are off here and at compile time (SQLITE_USE_URI=0).
+        flags |= SQLITE_OPEN_NOFOLLOW
+
+        let rc = sqlite3_open_v2(location, &opened, flags, nil)
+        if rc != SQLITE_OK {
+            let message = opened.map { String(cString: sqlite3_errmsg($0)) }
+                ?? "unable to open database"
+            if let opened { sqlite3_close_v2(opened) }
+            throw SQLiteError(code: rc, message: message)
         }
-        db = nil
+        guard let opened else {
+            throw SQLiteError(code: rc, message: "open returned no handle")
+        }
+        db = opened
+    }
+
+    /// Runtime hardening + the pragmas we need, then install the authorizer
+    /// and hooks (PLAN.md §7). Order matters: pragmas are issued *before* the
+    /// authorizer (which denies all user PRAGMA).
+    func configure() throws {
+        guard let db else { throw SQLiteEngineError.notOpen }
+
+        _ = csqlite_db_config_onoff(db, SQLITE_DBCONFIG_DEFENSIVE, 1)
+        _ = csqlite_db_config_onoff(db, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0)
+        _ = csqlite_db_config_onoff(db, SQLITE_DBCONFIG_TRUSTED_SCHEMA, 0)
+
+        sqlite3_limit(db, SQLITE_LIMIT_ATTACHED, 0)
+        sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, Int32(clamping: policy.maxSQLLength))
+        sqlite3_busy_timeout(db, policy.busyTimeout.millisecondsInt32)
+
+        try execInternal("PRAGMA foreign_keys=ON;")
+        try execInternal("PRAGMA temp_store=MEMORY;")   // pin temp spill (§5 step 2)
+        if location != ":memory:" && !policy.readOnly {
+            // WAL keeps -wal/-shm as in-dir siblings; best-effort.
+            _ = try? execInternal("PRAGMA journal_mode=WAL;")
+        }
+
+        let appData = Unmanaged.passUnretained(ctx).toOpaque()
+        sqlite3_set_authorizer(db, csqliteAuthorizerCallback, appData)
+        sqlite3_progress_handler(db, 10_000, csqliteProgressCallback, appData)
+        _ = sqlite3_commit_hook(db, csqliteCommitCallback, appData)
+        _ = sqlite3_update_hook(db, csqliteUpdateCallback, appData)
+        _ = sqlite3_rollback_hook(db, csqliteRollbackCallback, appData)
     }
 
     // MARK: Step loop
 
-    private func runScript(_ sql: String) throws -> RunResult {
+    func runScript(_ sql: String) throws -> RunResult {
         guard let db else { throw SQLiteEngineError.notOpen }
         var results: [ResultSet] = []
         // Attribute changes via the monotonic total-changes counter so that
@@ -287,8 +327,6 @@ public actor SQLiteConnection {
         return SQLiteError(code: rc, message: message)
     }
 
-    // MARK: Helpers
-
     @discardableResult
     private func execInternal(_ sql: String) throws -> Int {
         guard let db else { throw SQLiteEngineError.notOpen }
@@ -302,25 +340,19 @@ public actor SQLiteConnection {
         return Int(sqlite3_changes(db))
     }
 
-    private func flushAudit() async {
-        let events = ctx.drainEvents()
-        guard !events.isEmpty else { return }
-        await audit.record(events)
-    }
+    // MARK: Lifecycle
 
-    private func ensureOpen() throws {
-        if isClosed || db == nil { throw SQLiteEngineError.notOpen }
-    }
-}
-
-/// Carries the raw `sqlite3*` across to the (`@Sendable`) cancellation
-/// handler. `sqlite3_interrupt` is documented thread-safe with
-/// `SQLITE_THREADSAFE=1`, and `EngineContext` is `@unchecked Sendable`.
-private struct InterruptBox: @unchecked Sendable {
-    let db: OpaquePointer?
-    let ctx: EngineContext
+    /// Thread-safe with `SQLITE_THREADSAFE=1` — called from the cancellation
+    /// handler, possibly off the actor's executor.
     func interrupt() {
-        ctx.cancelled = true
         if let db { sqlite3_interrupt(db) }
+    }
+
+    func close() {
+        if let db {
+            sqlite3_set_authorizer(db, nil, nil)
+            sqlite3_close_v2(db)
+        }
+        db = nil
     }
 }
