@@ -19,21 +19,24 @@ See [`PLAN.md`](PLAN.md) for the full design (rev. 2).
 
 ## Building
 
-The SQLite amalgamation (`sqlite3.c` / `sqlite3.h`, ~9 MB of generated C)
-is **not committed** — it is fetched and SHA3-256-pinned, the same way
-SwiftBash stages its own prebuilt vendor blob. **Run the fetcher once
-before building:**
+The SQLite amalgamation (`sqlite3.c` / `sqlite3.h`) is **vendored (committed)**,
+so a fresh clone builds with no prerequisite step:
 
 ```sh
-scripts/fetch-sqlite.sh        # downloads + verifies into Sources/CSQLite
 swift build
 swift test
 ```
 
-The pin lives in `Sources/CSQLite/VERSION`. The script **fails closed**
-while the hash is the placeholder — paste the official SHA3-256 from
-<https://www.sqlite.org/download.html> into `VERSION`, or bootstrap from a
-trusted machine with `scripts/fetch-sqlite.sh --update-hash`.
+To **update** to a new SQLite release, bump the four fields in
+`Sources/CSQLite/VERSION` (version, amalgamation id, year, and the official
+SHA3-256 from <https://www.sqlite.org/download.html>) and re-vendor:
+
+```sh
+scripts/fetch-sqlite.sh --force   # downloads + SHA3-256-verifies, then commit the result
+```
+
+The script **fails closed** on a hash mismatch. (CI can also re-vendor via the
+`Vendor SQLite amalgamation` workflow when `VERSION` changes.)
 
 ## Usage
 

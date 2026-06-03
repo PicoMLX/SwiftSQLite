@@ -7,9 +7,9 @@ DerivedData/
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
 
-# Vendored SQLite amalgamation — fetched + SHA3-256-pinned by
-# scripts/fetch-sqlite.sh, never committed (see PLAN.md §9 / §M0).
-/Sources/CSQLite/sqlite3.c
-/Sources/CSQLite/include/sqlite3.h
-/Sources/CSQLite/include/sqlite3ext.h
+# The SQLite amalgamation (sqlite3.c / sqlite3.h) IS committed (vendored) so a
+# fresh clone builds with no prerequisite step and the package is usable as a
+# plain SwiftPM dependency. scripts/fetch-sqlite.sh refreshes it on a version
+# bump (it's SHA3-256-verified). shell.c / sqlite3ext.h aren't used — ignored.
 /Sources/CSQLite/shell.c
+/Sources/CSQLite/include/sqlite3ext.h
