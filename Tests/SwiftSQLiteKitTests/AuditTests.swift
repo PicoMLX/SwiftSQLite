@@ -160,4 +160,24 @@ struct AuditTests {
         let committed = await sink.committed
         #expect(committed.count <= 20, "committed: \(committed.count)")
     }
+
+    /// The cap also holds across many *separate* autocommit statements:
+    /// commit() promotes pending into events each statement, so without a cap
+    /// there (and a per-drain marker latch) the committed buffer would grow one
+    /// record per statement.
+    @Test func committedAuditBufferCappedAcrossManyStatements() async throws {
+        var policy = EnginePolicy()
+        policy.maxAuditRecords = 10
+        let sink = InMemoryAuditSink()
+        let db = try await SQLiteConnection(inMemory: policy, audit: sink)
+        try await db.execute("CREATE TABLE t(x);")
+        var script = ""
+        for i in 1...100 { script += "INSERT INTO t(x) VALUES (\(i));" }
+        try await db.run(script)
+        await db.close()
+
+        // ~cap + one marker + a few attempted, not ~110 from uncapped promotion.
+        let all = await sink.events
+        #expect(all.count <= 30, "audit buffer grew unbounded: \(all.count)")
+    }
 }

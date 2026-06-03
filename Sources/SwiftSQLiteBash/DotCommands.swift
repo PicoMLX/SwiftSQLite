@@ -177,6 +177,15 @@ enum DotCommandRunner {
             schemaSQL += " ORDER BY (type='table') DESC, name;"
 
             let schema = try await connection.query(schemaSQL)
+            if schema.truncated {
+                // Fail closed like the per-table data check below: a schema
+                // with more than rowLimit objects would otherwise dump only a
+                // prefix and emit a valid-looking COMMIT, silently omitting
+                // whole tables/indexes/triggers.
+                return .failed(
+                    "schema exceeds the \(connection.rowLimit)-object export cap; "
+                    + ".dump aborted to avoid silently omitting schema objects")
+            }
             var tableNames: [String] = []
             var deferredSchema: [String] = []   // indexes/triggers/views, emitted last
             for row in schema.rows {

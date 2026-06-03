@@ -241,11 +241,14 @@ final class EngineContext: @unchecked Sendable {
     /// Promote everything in `pending` into the committed stream.
     func commit() {
         for record in pending {
+            // Honor the cap here too: a script of many small autocommit writes
+            // drains `pending` into `events` each statement, so without this
+            // check the committed buffer could grow past `maxAuditRecords`.
+            guard events.count < maxAuditRecords else { noteAuditTruncated(); break }
             events.append(.committed(table: record.table, rowid: record.rowid, op: record.op))
         }
         pending.removeAll(keepingCapacity: true)
         savepoints.removeAll(keepingCapacity: true)
-        auditTruncated = false
     }
 
     /// Drop pending rows — the transaction rolled back, so they never
@@ -259,7 +262,6 @@ final class EngineContext: @unchecked Sendable {
     func rollback() {
         pending.removeAll(keepingCapacity: true)
         savepoints.removeAll(keepingCapacity: true)
-        auditTruncated = false
     }
 
     // MARK: Timeout / cancellation
@@ -282,6 +284,10 @@ final class EngineContext: @unchecked Sendable {
     func drainEvents() -> [AuditEvent] {
         let out = events
         events.removeAll(keepingCapacity: true)
+        // Re-arm the truncation marker per drain cycle (not per transaction):
+        // under autocommit every statement commits, so resetting in commit()
+        // would let each subsequent statement append a fresh marker unbounded.
+        auditTruncated = false
         return out
     }
 
