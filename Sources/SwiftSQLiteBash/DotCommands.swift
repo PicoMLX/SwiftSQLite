@@ -139,7 +139,10 @@ enum DotCommandRunner {
             var schemaSQL = "SELECT type, name, sql FROM sqlite_schema "
                 + "WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
             if let only {
-                schemaSQL += " AND name='\(escapeSQLString(only))'"
+                // Match the table itself (name) and its indexes/triggers
+                // (tbl_name) so a filtered dump keeps table-owned schema.
+                let escaped = escapeSQLString(only)
+                schemaSQL += " AND (name='\(escaped)' OR tbl_name='\(escaped)')"
             }
             schemaSQL += " ORDER BY (type='table') DESC, name;"
 
@@ -280,20 +283,28 @@ private func runSQLBuffer(
     connection: SQLiteConnection,
     options: OutputOptions
 ) async -> Bool {
-    do {
-        let result = try await connection.run(sql)
-        for resultSet in result.results {
-            let rendered = ResultRenderer.render(resultSet, options: options)
-            if !rendered.isEmpty { Shell.bashCurrent.stdout(rendered) }
-            if resultSet.truncated {
-                Shell.bashCurrent.stderr("sqlite3: output truncated at the row limit\n")
+    // Run statements one at a time so a failure doesn't abort the rest of the
+    // buffer — sqlite3-like lenient mode (no `-bail`). A failed statement is
+    // reported to stderr and sets the exit status, but later statements still
+    // run. BEGIN/COMMIT still work: they execute on the same connection.
+    var ok = true
+    for statement in SQLiteStatements.split(sql) {
+        guard !statement.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+        do {
+            let result = try await connection.run(statement)
+            for resultSet in result.results {
+                let rendered = ResultRenderer.render(resultSet, options: options)
+                if !rendered.isEmpty { Shell.bashCurrent.stdout(rendered) }
+                if resultSet.truncated {
+                    Shell.bashCurrent.stderr("sqlite3: output truncated at the row limit\n")
+                }
             }
+        } catch {
+            Shell.bashCurrent.stderr("sqlite3: \(errorText(error))\n")
+            ok = false
         }
-        return true
-    } catch {
-        Shell.bashCurrent.stderr("sqlite3: \(errorText(error))\n")
-        return false
     }
+    return ok
 }
 
 // MARK: - shared SQL helpers
