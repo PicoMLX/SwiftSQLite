@@ -33,7 +33,12 @@ struct AuthorizerTests {
             _ = try await db.run(sql)
             Issue.record("expected '\(label)' to be denied")
         } catch let error as SQLiteError {
-            #expect(error.message.lowercased().contains("authoriz"),
+            // A SQLITE_DENY surfaces as "not authorized" for most operations,
+            // but as "access to TABLE.COLUMN is prohibited" for a denied READ —
+            // both are authorizer-owned denials (vs. defensive-mode "may not be
+            // modified", a syntax error, or "no such function").
+            let message = error.message.lowercased()
+            #expect(message.contains("authoriz") || message.contains("prohibit"),
                     "'\(label)' must be an authorizer DENY, got: \(error.message)")
         } catch {
             Issue.record("'\(label)' threw a non-SQLiteError: \(error)")
