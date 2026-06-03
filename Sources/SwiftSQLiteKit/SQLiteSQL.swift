@@ -37,8 +37,15 @@ public enum SQLiteSQL {
                 while i < s.count && s[i] != "\n" { i += 1 }
             case "/" where i + 1 < s.count && s[i + 1] == "*":
                 i += 2
-                while i + 1 < s.count && !(s[i] == "*" && s[i + 1] == "/") { i += 1 }
-                i += 2   // skip the closing */ (or run past the end if unterminated)
+                var closed = false
+                while i + 1 < s.count {
+                    if s[i] == "*" && s[i + 1] == "/" { i += 2; closed = true; break }
+                    i += 1
+                }
+                // An *unterminated* block comment is a pending (incomplete)
+                // statement, not a boundary — so a following dot-command stays
+                // data, matching how the sqlite3 shell keeps reading.
+                if !closed { return false }
             default:
                 return false   // a real (non-comment) token
             }

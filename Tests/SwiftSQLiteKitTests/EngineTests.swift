@@ -111,4 +111,17 @@ struct EngineTests {
             #expect(FileManager.default.fileExists(atPath: url.path) == false)
         }
     }
+
+    /// Statement-boundary detection: complete statements and whitespace/closed
+    /// comments are boundaries; an unfinished statement or an *unterminated*
+    /// block comment is not (a following dot-command must stay data).
+    @Test func statementBoundaryClassification() {
+        #expect(SQLiteSQL.isAtStatementBoundary("") == true)
+        #expect(SQLiteSQL.isAtStatementBoundary("   \n\t") == true)
+        #expect(SQLiteSQL.isAtStatementBoundary("-- a line comment\n") == true)
+        #expect(SQLiteSQL.isAtStatementBoundary("/* a block */") == true)
+        #expect(SQLiteSQL.isAtStatementBoundary("SELECT 1;") == true)
+        #expect(SQLiteSQL.isAtStatementBoundary("SELECT 1") == false)
+        #expect(SQLiteSQL.isAtStatementBoundary("/* unterminated") == false)
+    }
 }

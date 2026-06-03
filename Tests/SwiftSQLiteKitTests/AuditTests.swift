@@ -180,4 +180,22 @@ struct AuditTests {
         let all = await sink.events
         #expect(all.count <= 30, "audit buffer grew unbounded: \(all.count)")
     }
+
+    /// SQLite resolves savepoint names case-insensitively, so a `ROLLBACK TO s`
+    /// must trim a `SAVEPOINT S` even when the casing differs — otherwise the
+    /// rolled-back row leaks into the committed stream.
+    @Test func savepointRollbackIsCaseInsensitive() async throws {
+        let sink = InMemoryAuditSink()
+        let db = try await SQLiteConnection(inMemory: .default, audit: sink)
+        try await db.execute("CREATE TABLE t(x);")
+        try await db.run(
+            "BEGIN; SAVEPOINT S; INSERT INTO t(x) VALUES (1); ROLLBACK TO s; COMMIT;")
+        await db.close()
+
+        let committed = await sink.committed
+        #expect(!committed.contains {
+            if case .committed(_, _, "INSERT") = $0 { return true }
+            return false
+        }, "case-mismatched ROLLBACK TO leaked into committed: \(committed)")
+    }
 }

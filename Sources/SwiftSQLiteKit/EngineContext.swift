@@ -67,8 +67,12 @@ final class EngineContext: @unchecked Sendable {
         return decision
     }
 
-    private func applySavepoint(operation: String?, name: String?) {
-        guard let name else { return }
+    private func applySavepoint(operation: String?, name rawName: String?) {
+        guard let rawName else { return }
+        // SQLite resolves savepoint names case-insensitively, so match on a
+        // normalized name — otherwise `SAVEPOINT S … ROLLBACK TO s` wouldn't
+        // trim the pending rows and would over-report them as committed.
+        let name = rawName.lowercased()
         switch operation {
         case "BEGIN":
             savepoints.append((name: name, mark: pending.count))
@@ -101,15 +105,19 @@ final class EngineContext: @unchecked Sendable {
         // reserved object. A deliberate limitation; the audit trail itself is
         // an external file, not an in-DB `_audit*` table.)
         if isReserved(object) { return SQLITE_DENY }
-        // CREATE INDEX/TRIGGER puts the NEW object's name in arg1 (the owning
-        // table is in arg2, already covered by `object`). Reject a reserved new
-        // name too — e.g. `CREATE INDEX _audit_i ON t` / `CREATE TRIGGER
-        // _audit_tr … ON t` — so the reserved namespace can't be populated.
-        if action == SQLITE_CREATE_INDEX || action == SQLITE_CREATE_TEMP_INDEX
-            || action == SQLITE_CREATE_TRIGGER
-            || action == SQLITE_CREATE_TEMP_TRIGGER,
-           isReserved(arg1) {
-            return SQLITE_DENY
+        // CREATE/DROP INDEX|TRIGGER puts the index/trigger name in arg1 (the
+        // owning table is in arg2, already covered by `object`). Reject a
+        // reserved name in arg1 so the `_audit*` namespace can be neither
+        // populated (`CREATE INDEX _audit_i ON t`) nor have its objects dropped
+        // (`DROP TRIGGER _audit_tr` — an `_audit*` object seeded out-of-band).
+        switch action {
+        case SQLITE_CREATE_INDEX, SQLITE_CREATE_TEMP_INDEX,
+             SQLITE_CREATE_TRIGGER, SQLITE_CREATE_TEMP_TRIGGER,
+             SQLITE_DROP_INDEX, SQLITE_DROP_TEMP_INDEX,
+             SQLITE_DROP_TRIGGER, SQLITE_DROP_TEMP_TRIGGER:
+            if isReserved(arg1) { return SQLITE_DENY }
+        default:
+            break
         }
 
         switch action {

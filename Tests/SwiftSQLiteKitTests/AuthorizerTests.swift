@@ -133,6 +133,26 @@ struct AuthorizerTests {
         await guarded.close()
     }
 
+    /// The reserved namespace also resists DROP: an `_audit*` index/trigger
+    /// seeded out-of-band must not be droppable by user SQL (the name is in
+    /// arg1 for DROP INDEX/TRIGGER, same as CREATE).
+    @Test func droppingReservedIndexIsDenied() async throws {
+        let url = makeTempDatabaseURL()
+        defer { cleanupTempDB(url) }
+        var seedPolicy = EnginePolicy()
+        seedPolicy.reservedTablePrefix = ""
+        let seed = try await SQLiteConnection(
+            url: url, policy: seedPolicy, audit: InMemoryAuditSink(),
+            authorize: allowAllAuthorize)
+        try await seed.execute("CREATE TABLE t(x); CREATE INDEX _audit_idx ON t(x);")
+        await seed.close()
+
+        let guarded = try await SQLiteConnection(
+            url: url, audit: InMemoryAuditSink(), authorize: allowAllAuthorize)
+        await expectAuthDenied(guarded, "DROP INDEX _audit_idx;", "DROP INDEX _audit_*")
+        await guarded.close()
+    }
+
     /// A reserved trigger name is rejected (the new object's name is in arg1) —
     /// the create-side guard must cover triggers, not just tables/indexes.
     @Test func reservedTriggerNameIsDenied() async throws {
