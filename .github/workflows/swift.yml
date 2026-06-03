@@ -10,12 +10,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# NOTE ON THE SQLITE PIN
-# scripts/fetch-sqlite.sh refuses to download until the official SHA3-256
-# is pinned in Sources/CSQLite/VERSION (fail-closed). To let CI run before
-# that one-time pin, the fetch steps below export SQLITE_ALLOW_UNPINNED=1.
-# Once you paste the real hash into VERSION, verification activates
-# automatically and the override becomes a no-op — you can drop it then.
+# scripts/fetch-sqlite.sh downloads the SQLite amalgamation and verifies it
+# against the SHA3-256 pinned in Sources/CSQLite/VERSION (fail-closed on a
+# mismatch). Both jobs therefore need network access to sqlite.org.
 #
 # Building SwiftSQLiteBash pulls in SwiftBash's BashCommandKit, which links
 # the SwiftPorts CLI surface (libgit2 + the bzip2/xz/zstd/lz4 family), so
@@ -41,8 +38,6 @@ jobs:
       - name: Verify Swift version
         run: swift --version
       - name: Fetch SQLite amalgamation
-        env:
-          SQLITE_ALLOW_UNPINNED: "1"   # see "NOTE ON THE SQLITE PIN" above
         run: ./scripts/fetch-sqlite.sh
       - name: Build (macOS)
         run: swift build --build-tests -v
@@ -66,8 +61,6 @@ jobs:
       - name: Verify Swift version
         run: swift --version
       - name: Fetch SQLite amalgamation
-        env:
-          SQLITE_ALLOW_UNPINNED: "1"   # see "NOTE ON THE SQLITE PIN" above
         run: ./scripts/fetch-sqlite.sh
       - name: Build (Linux)
         run: swift build --build-tests -v
