@@ -11,4 +11,4 @@ SQLITE_YEAR=2024
 # "Source Code" table on https://www.sqlite.org/download.html.
 # fetch-sqlite.sh FAILS CLOSED while this is the placeholder unless
 # SQLITE_ALLOW_UNPINNED=1 is exported — never relax that in CI.
-SQLITE_SHA3_256=REPLACE_WITH_OFFICIAL_SHA3_256_FROM_SQLITE_ORG
+SQLITE_SHA3_256=0e4df2263ef8169f9396b9535d9654d8d64ae8eb1a339ba06c7b12a72e6fb020
