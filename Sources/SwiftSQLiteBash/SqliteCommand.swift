@@ -185,7 +185,7 @@ public struct SqliteCommand: ParsableBashCommand {
     private func makeAuditSink(
         enabled: Bool, explicitPath: String?, databaseURL: URL?, shell: Shell
     ) async throws -> any AuditSink {
-        guard enabled else { return InMemoryAuditSink() }
+        guard enabled else { return NoOpAuditSink() }
         // Explicit -audit PATH wins (honored even for :memory:); otherwise
         // default to a `<db>.audit.log` sibling for file DBs. An in-memory DB
         // with no explicit path has nowhere persistent to write.
@@ -198,7 +198,7 @@ public struct SqliteCommand: ParsableBashCommand {
             auditURL = databaseURL.appendingPathExtension("audit.log")
             isExplicit = false
         } else {
-            return InMemoryAuditSink()
+            return NoOpAuditSink()
         }
         // A FileAuditSink writes a real host file, so it needs the same native
         // backing the §4 DB guard requires. That guard is skipped for :memory:,
@@ -211,7 +211,7 @@ public struct SqliteCommand: ParsableBashCommand {
                     message: "-audit needs a real-disk filesystem; this shell's "
                     + "backing can't safely write a host audit file")
             }
-            return InMemoryAuditSink()
+            return NoOpAuditSink()
         }
         // Refuse an audit path that resolves to the database file or one of its
         // SQLite sidecars: a FileAuditSink appending JSON Lines into the live DB
@@ -244,7 +244,7 @@ public struct SqliteCommand: ParsableBashCommand {
                     message: "-audit path denied: \(errorText(error))")
             }
             shell.stderr("sqlite3: audit log disabled (path denied): \(errorText(error))\n")
-            return InMemoryAuditSink()
+            return NoOpAuditSink()
         }
     }
 }

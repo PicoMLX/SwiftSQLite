@@ -292,7 +292,15 @@ private final class ConnectionHandle: @unchecked Sendable {
         // query like `SELECT zeroblob(500000000)` can't exhaust memory when
         // its value is copied out in columnValue (DoS guard).
         sqlite3_limit(db, SQLITE_LIMIT_LENGTH, Int32(clamping: policy.maxValueBytes))
-        sqlite3_busy_timeout(db, policy.busyTimeout.millisecondsInt32)
+        // Clamp the busy-wait to the statement budget: the progress handler
+        // isn't called while SQLite blocks in the busy handler, so a lock wait
+        // longer than `statementTimeout` would blow the per-statement deadline
+        // on a contended DB. `.zero` statementTimeout means "no budget".
+        let busyMs: Int32 = policy.statementTimeout == .zero
+            ? policy.busyTimeout.millisecondsInt32
+            : min(policy.busyTimeout.millisecondsInt32,
+                  policy.statementTimeout.millisecondsInt32)
+        sqlite3_busy_timeout(db, busyMs)
 
         try execInternal("PRAGMA foreign_keys=ON;")
         try execInternal("PRAGMA temp_store=MEMORY;")   // pin temp spill (§5 step 2)

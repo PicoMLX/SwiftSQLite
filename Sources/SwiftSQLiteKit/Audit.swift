@@ -47,6 +47,17 @@ public actor InMemoryAuditSink: AuditSink {
     public var committed: [AuditEvent] { events.filter(\.isCommitted) }
 }
 
+/// An `AuditSink` that discards everything — for when the trail is
+/// intentionally not persisted (`-no-audit`, or an in-memory DB with no
+/// `-audit` path). Unlike `InMemoryAuditSink` it accumulates nothing, so a
+/// long script can't grow memory through a thrown-away trail (the
+/// `EngineContext` cap bounds each flush, but an accumulating sink would still
+/// retain every flushed batch).
+public struct NoOpAuditSink: AuditSink {
+    public init() {}
+    public func record(_ events: [AuditEvent]) async {}
+}
+
 /// Carries an `errno`-derived message into `reportFailure`'s diagnostic.
 private struct AuditWriteError: Error, CustomStringConvertible {
     let message: String

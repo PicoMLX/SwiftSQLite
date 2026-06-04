@@ -26,12 +26,12 @@ let package = Package(
     ],
     targets: [
         // Vendored libsqlite3 amalgamation, hardened at compile time
-        // (PLAN.md §6). `sqlite3.c` / `include/sqlite3.h` are NOT committed
-        // — they are fetched + SHA-256-pinned by `scripts/fetch-sqlite.sh`
-        // (mirrors SwiftBash's own `scripts/fetch-bun-webkit.sh` pattern of
-        // gitignoring the large vendored blob). `shims.c` /
-        // `include/csqlite_shims.h` ARE committed: they wrap the variadic
-        // `sqlite3_db_config()` calls Swift cannot reach directly.
+        // (PLAN.md §6). `sqlite3.c` / `include/sqlite3.h` ARE committed
+        // (vendored in-repo, so a clean checkout builds offline);
+        // `scripts/fetch-sqlite.sh` regenerates them — SHA3-256-pinned — on a
+        // version bump. `shims.c` / `include/csqlite_shims.h` are committed
+        // too: they wrap the variadic `sqlite3_db_config()` calls Swift
+        // cannot reach directly.
         .target(
             name: "CSQLite",
             exclude: ["VERSION"],
