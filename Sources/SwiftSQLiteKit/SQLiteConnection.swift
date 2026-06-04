@@ -340,6 +340,11 @@ private final class ConnectionHandle: @unchecked Sendable {
                 }
                 cursor = tail
                 guard let statement else { continue }   // whitespace / comment
+                // A `defer` in a loop body runs at each iteration's end, so every
+                // statement is finalized before the next is prepared. A capped
+                // (truncated) read therefore releases its cursor here, and a
+                // later statement in the same script can't see a still-active
+                // SELECT (no cross-statement SQLITE_LOCKED).
                 defer { sqlite3_finalize(statement) }
                 if let resultSet = try step(statement) {
                     results.append(resultSet)
