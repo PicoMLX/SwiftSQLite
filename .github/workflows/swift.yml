@@ -1,0 +1,49 @@
+name: Swift
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# macOS-only, mirroring the sibling SwiftGog repo's proven CI. A full
+# SwiftBash consumer builds cleanly on macOS (Xcode 26 / Swift 6.2); the Linux
+# build of BashCommandKit's SwiftPorts closure (libgit2 + the compression
+# family + ripgrep) needs heavier system-lib setup. SwiftSQLiteKit itself is
+# SwiftBash-agnostic and Linux-clean, so a Linux engine-only job can be added
+# later without that closure.
+#
+# The SQLite amalgamation (sqlite3.c/.h) is vendored (committed), so the build
+# needs no network. Package.resolved pins marcprux/swift-archive by revision —
+# its `master` branch was renamed, so a fresh resolve would otherwise fail
+# chasing the dead ref.
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # SwiftBash's manifest declares swift-tools-version 6.2, so the
+      # toolchain must be >= 6.2. Xcode 26.0 ships Swift 6.2.
+      - name: Select Xcode 26.0
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26.0"
+      # bzip2 / zstd back SwiftPorts' compression kits; macOS runners usually
+      # already have them, so this is a defensive idempotent install.
+      - name: Install C dependencies (Homebrew)
+        run: |
+          for pkg in bzip2 zstd; do
+            brew list --versions "$pkg" >/dev/null 2>&1 || brew install "$pkg"
+          done
+      - name: Verify Swift version
+        run: swift --version
+      - name: Build (including tests)
+        run: swift build --build-tests -v
+      - name: Test
+        run: swift test --skip-build

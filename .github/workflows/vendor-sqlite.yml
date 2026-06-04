@@ -1,0 +1,45 @@
+name: Vendor SQLite amalgamation
+
+# Fetches, SHA3-256-verifies, and commits sqlite3.c / sqlite3.h into the repo.
+# Run manually (Actions ▸ "Vendor SQLite amalgamation" ▸ Run workflow) or it
+# fires automatically when Sources/CSQLite/VERSION changes (a version bump).
+# The committed amalgamation is what makes the package build from a fresh clone
+# / as a plain SwiftPM dependency — this workflow just keeps it in sync with
+# the pin in VERSION.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "Sources/CSQLite/VERSION"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vendor-sqlite-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure fetch tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl unzip openssl ca-certificates
+      - name: Fetch + verify amalgamation
+        run: ./scripts/fetch-sqlite.sh --force
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Sources/CSQLite/sqlite3.c Sources/CSQLite/include/sqlite3.h
+          if git diff --cached --quiet; then
+            echo "Amalgamation already matches the pin — nothing to commit."
+          else
+            git commit -m "Vendor sqlite3 amalgamation (SHA3-256 verified)"
+            git push
+          fi
