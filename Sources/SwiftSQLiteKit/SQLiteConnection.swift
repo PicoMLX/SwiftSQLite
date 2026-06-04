@@ -366,27 +366,33 @@ private final class ConnectionHandle: @unchecked Sendable {
         var rows: [[SQLiteValue]] = []
         var truncated = false
         var resultBytes = 0
+        // A read-only statement (SELECT) can stop at the cap; a writing
+        // statement (e.g. INSERT … RETURNING) must keep stepping so its side
+        // effects complete and a later error/constraint still surfaces, even
+        // when its RETURNING output is truncated.
+        let readOnlyStatement = sqlite3_stmt_readonly(statement) != 0
         loop: while true {
             let rc = sqlite3_step(statement)
             switch rc {
             case SQLITE_ROW:
+                if truncated {
+                    continue   // capped: drain a writing statement to completion
+                }
                 if rows.count >= policy.rowLimit {
                     truncated = true
-                    break loop
+                } else {
+                    var row: [SQLiteValue] = []
+                    row.reserveCapacity(columnCount)
+                    for index in 0..<columnCount {
+                        row.append(columnValue(statement, Int32(index)))
+                    }
+                    rows.append(row)
+                    // Bound *total* buffered result memory, not just per-cell
+                    // (`maxValueBytes`) × `rowLimit`, which permits hundreds of GB.
+                    resultBytes += row.reduce(0) { $0 + $1.approxByteSize }
+                    if resultBytes > policy.maxResultBytes { truncated = true }
                 }
-                var row: [SQLiteValue] = []
-                row.reserveCapacity(columnCount)
-                for index in 0..<columnCount {
-                    row.append(columnValue(statement, Int32(index)))
-                }
-                rows.append(row)
-                // Bound *total* buffered result memory, not just per-cell
-                // (`maxValueBytes`) × `rowLimit`, which permits hundreds of GB.
-                resultBytes += row.reduce(0) { $0 + $1.approxByteSize }
-                if resultBytes > policy.maxResultBytes {
-                    truncated = true
-                    break loop
-                }
+                if truncated && readOnlyStatement { break loop }
             case SQLITE_DONE:
                 break loop
             default:

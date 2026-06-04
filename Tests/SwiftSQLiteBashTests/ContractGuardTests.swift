@@ -117,6 +117,18 @@ struct ContractGuardTests {
         }
     }
 
+    /// An in-memory (non-native) shell refuses file databases; an explicit
+    /// `-audit` would still write a HOST file, so it must be refused too — even
+    /// for a `:memory:` database, where the §4 DB guard is skipped.
+    @Test func explicitAuditOnNonNativeShellFailsClosed() async throws {
+        let shell = Shell(fileSystem: InMemoryFileSystem())
+        shell.installShellBuiltin(SqliteCommand.self)
+        let result = try await runCapturing(
+            shell, "sqlite3 -audit /tmp/swiftsqlite-nonnative-audit.log :memory: 'SELECT 1;'")
+        #expect(!result.status.isSuccess)
+        #expect(result.stderr.contains("audit"), "stderr: \(result.stderr)")
+    }
+
     /// An explicit `-audit PATH` that is authorized but unusable as a log file
     /// (here, an existing directory) must fail closed via the preflight open,
     /// not run SQL unaudited and only error on the first post-commit flush.

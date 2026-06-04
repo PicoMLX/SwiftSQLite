@@ -78,6 +78,24 @@ struct EngineTests {
         await db.close()
     }
 
+    /// Truncating a *writing* statement's output must not abandon its writes:
+    /// an `INSERT … RETURNING` whose RETURNING rows hit the cap still inserts
+    /// every row (drained to completion), unlike a read-only SELECT.
+    @Test func truncatedWritingStatementStillCompletes() async throws {
+        var policy = EnginePolicy()
+        policy.rowLimit = 2
+        let db = try await SQLiteConnection(inMemory: policy, audit: InMemoryAuditSink())
+        try await db.execute("CREATE TABLE t(x);")
+        let result = try await db.query(
+            "INSERT INTO t(x) VALUES (1),(2),(3),(4),(5) RETURNING x;")
+        #expect(result.truncated == true)
+        #expect(result.rows.count == 2)
+        let count = try await db.query("SELECT count(*) FROM t;")
+        #expect(count.rows[0][0] == .integer(5),
+                "all rows must be inserted, got \(count.rows[0][0])")
+        await db.close()
+    }
+
     @Test func longRunningQueryIsInterruptedByTimeout() async throws {
         var policy = EnginePolicy()
         policy.statementTimeout = .milliseconds(100)

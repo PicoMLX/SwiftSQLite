@@ -200,6 +200,19 @@ public struct SqliteCommand: ParsableBashCommand {
         } else {
             return InMemoryAuditSink()
         }
+        // A FileAuditSink writes a real host file, so it needs the same native
+        // backing the §4 DB guard requires. That guard is skipped for :memory:,
+        // so without this an explicit `-audit` on a non-native shell would still
+        // write to the host even though the shell refuses file databases.
+        guard backingIsSupportedForSQLite(
+            shell.fileSystem, hasSandbox: shell.sandbox != nil) else {
+            if isExplicit {
+                throw AuditPathDenied(
+                    message: "-audit needs a real-disk filesystem; this shell's "
+                    + "backing can't safely write a host audit file")
+            }
+            return InMemoryAuditSink()
+        }
         // Refuse an audit path that resolves to the database file or one of its
         // SQLite sidecars: a FileAuditSink appending JSON Lines into the live DB
         // (or its -wal/-shm/-journal) would corrupt it after otherwise-successful
